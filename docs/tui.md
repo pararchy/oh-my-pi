@@ -2,6 +2,22 @@
 
 This document covers the **current** TUI contract used by `packages/coding-agent` and `packages/tui` for extension UI, custom tool UI, and custom renderers.
 
+## Grimoire fixed-top mode (personal fork)
+
+`PARA_OMP_LAYOUT=top` selects an alternate-screen, row-rendered viewport. The
+composer keeps extension widgets, status/HUDs, and interactive dialogs at the
+top; only the conversation scrolls (Page Up/Page Down and wheel). The prompt
+editor stays separate at the bottom, with its draft preserved across approval
+and ask dialogs. Enter/arrows answer the focused dialog, not the parked draft.
+
+The compositor renders a bounded transcript tail rather than flattening the
+entire session on every animation frame. On short terminals, dialogs take
+precedence over decorative chrome. Terminal images register inside the normal
+alternate-screen image pass. Native TSP negotiation is not used in this mode:
+its current surface contract has only a bottom dock. Without the environment
+flag, upstream rendering and input behavior are unchanged.
+
+
 ## What this subsystem is
 
 The runtime has two layers:

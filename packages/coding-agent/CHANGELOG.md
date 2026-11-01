@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Grimoire personal fork
+
+- Added opt-in fixed-top persona/status/dialog chrome with a separately scrolling conversation and parked prompt editor (`PARA_OMP_LAYOUT=top`).
+- Approval and ask-dialog navigation no longer submits a nonempty parked draft in Grimoire mode.
+- Kept terminal image budgeting and cursor rendering inside the fullscreen lifecycle; upstream default mode remains unchanged.
+
+
 ## [18.14.1] - 2026-10-31
 
 ### Added

@@ -2463,6 +2463,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		this.composer.setRuntimeChildren(
 			[
+				...(this.composer.fullscreen ? [this.hookWidgetContainerAbove] : []),
 				this.chatContainer,
 				this.pendingMessagesContainer,
 				this.todoContainer,
@@ -2483,7 +2484,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				// composer collapses that gap so its status band sits flush).
 				this.statusContainer,
 				this.attachmentChipsContainer,
-				this.hookWidgetContainerAbove,
+				...(!this.composer.fullscreen ? [this.hookWidgetContainerAbove] : []),
 				this.editorContainer,
 				this.hookWidgetContainerBelow,
 			],

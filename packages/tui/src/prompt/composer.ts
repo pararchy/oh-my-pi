@@ -27,6 +27,8 @@ import type { WordCompletionMethod } from "./word-completion";
 import { type AnimationFrame, TranscriptContainer } from "../chrome/transcript-container";
 import { WelcomeComponent } from "./welcome";
 import { ensureThemeSync, getEditorTheme, theme } from "../theme/theme";
+import { GrimoireLayout } from "./grimoire-layout";
+import { matchesKey } from "../keys";
 
 const DOUBLE_INTERRUPT_MS = 500;
 // How long idle chrome must hold its height after a turn before it is treated as permanent.
@@ -246,6 +248,8 @@ function rowTargetCandidates(target: Component): ((local: number) => string[]) |
  */
 export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 	readonly ui: TUI;
+	readonly fullscreen = process.env.PARA_OMP_LAYOUT === "top";
+	readonly #grimoire = new GrimoireLayout();
 	#editor: CustomEditor;
 	readonly #header = new Container();
 	readonly #bootstrapInputGap = new Spacer(1);
@@ -422,6 +426,17 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		// A settle timer that fires while the TUI is stopped (external editor, suspend) is dropped;
 		// forget it on restart so the next frame re-arms instead of waiting on it forever.
 		this.ui.addStartListener(() => this.#resetIdleChrome());
+		this.ui.addInputListener(data => {
+			if (!this.fullscreen || this.ui.hasOverlay() || this.ui.getFocused() !== this.editor) return;
+			const wheel = /^\x1b\[<(\d+);\d+;\d+[Mm]$/.exec(data);
+			if (matchesKey(data, "pageUp") || wheel?.[1] === "64") {
+				this.#grimoire.scroll(wheel ? 3 : this.#grimoire.pageRows);
+			} else if (matchesKey(data, "pageDown") || wheel?.[1] === "65") {
+				this.#grimoire.scroll(-(wheel ? 3 : this.#grimoire.pageRows));
+			} else return;
+			this.ui.requestRender();
+			return { consume: true };
+		}, { prepend: true });
 	}
 	/**
 	 * Rows the below-transcript chrome under `root` (editor, status line, …)
@@ -445,6 +460,9 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		const roots = this.#runtimeMounted
 			? [...this.#runtimeChildren, this.#statusHost]
 			: [this.#header, this.#bootstrapInputGap, this.editor, this.#statusHost];
+		if (this.fullscreen) {
+			return { viewport: this.#grimoire.render(roots, this.editor, width, rows) };
+		}
 		const transcriptIndex = roots.findIndex(root => root instanceof TranscriptContainer);
 		if (transcriptIndex < 0) {
 			this.#lastClickSpans = [];

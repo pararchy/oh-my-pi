@@ -193,6 +193,8 @@ export interface TerminalFramePlan {
 
 /** Produces bounded terminal frames and retires acknowledged history batches. */
 export interface TerminalFrameProvider {
+	/** Keep the product viewport on the alternate screen, independently of modals. */
+	readonly fullscreen?: boolean;
 	renderFrame(viewport: ViewportSize): TerminalFramePlan;
 	acknowledgeHistory(id: number): void;
 	/** Full semantic viewport used only on the transient resize buffer. */
@@ -1747,6 +1749,8 @@ export class TUI extends Container {
 
 	/** Switch to the surface (adopting the one a stop/start cycle closed). */
 	#startNative(hello: TspHello): void {
+		// Grimoire owns a fixed-top row layout; TSP only has a bottom dock.
+		if (this.#frameProvider?.fullscreen) return;
 		this.#eraseRowPaintForNative();
 		this.#nativeLive = true;
 		if (this.#native) {
@@ -3278,7 +3282,7 @@ export class TUI extends Container {
 		return this.#compositeOverlaysIntoWindow(viewport, width, height);
 	}
 
-	#compositeOverlaysIntoWindow(window: string[], termWidth: number, termHeight: number): string[] {
+	#compositeOverlaysIntoWindow(window: readonly string[], termWidth: number, termHeight: number): string[] {
 		const result = [...window];
 		for (const entry of this.overlayStack) {
 			if (!this.#isOverlayVisible(entry)) continue;
@@ -3904,12 +3908,12 @@ export class TUI extends Container {
 		// requests it, borrow the terminal's alternate buffer and paint only the
 		// modal there; the normal screen and all accounting stay untouched.
 		const topOverlay = this.#getTopmostVisibleOverlay();
-		const wantAlt = topOverlay?.options?.fullscreen === true;
+		const wantAlt = topOverlay?.options?.fullscreen === true || this.#frameProvider?.fullscreen === true;
 		const wantMouse: MouseTrackingState =
 			topOverlay === undefined
-				? this.#inlineMouseProvider?.() === true
-					? "inline"
-					: "off"
+				? this.#frameProvider?.fullscreen
+					? "full"
+					: this.#inlineMouseProvider?.() === true ? "inline" : "off"
 				: wantAlt && topOverlay.options?.mouseTracking !== false
 					? "full"
 					: "off";
@@ -4517,11 +4521,13 @@ export class TUI extends Container {
 	 * The normal transcript is never composited into the alternate buffer.
 	 */
 	#renderAltFrame(width: number, height: number): void {
-		// oxlint-disable-next-line unicorn/no-new-array -- alt-frame length preallocation
-		const base: string[] = new Array(Math.max(0, height)).fill("");
 		let lines: string[];
 		do {
 			this.#imageBudget.beginPass(false, true);
+			// Transcript images must register inside the same pass as overlays.
+			const base = this.#frameProvider?.fullscreen && !this.#getTopmostVisibleOverlay()?.options?.fullscreen
+				? this.#frameProvider.renderFrame({ columns: width, rows: height }).viewport
+				: new Array<string>(Math.max(0, height)).fill("");
 			lines = this.#compositeOverlaysIntoWindow(base, width, height);
 		} while (this.#imageBudget.endPass());
 		const markers: { row: number; col: number }[] = [];
@@ -4529,12 +4535,11 @@ export class TUI extends Container {
 		const topOverlay = this.#getTopmostVisibleOverlay();
 		const focused = this.#focusedComponent;
 		const acceptsTerminalCursor =
-			topOverlay !== undefined &&
 			focused !== null &&
 			isFocusable(focused) &&
 			focused.focused &&
 			typeof focused.setUseTerminalCursor === "function" &&
-			isOverlayFocusTarget(topOverlay.component, focused);
+			(this.#frameProvider?.fullscreen === true || (topOverlay !== undefined && isOverlayFocusTarget(topOverlay.component, focused)));
 		this.#emitAltFrame(prepared, width, height, true, acceptsTerminalCursor ? (markers[0] ?? null) : null);
 	}
 
