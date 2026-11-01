@@ -1631,6 +1631,17 @@ export class TUI extends Container {
 					// A fullscreen overlay owns the alt buffer: repaint the modal at
 					// the new size. Never snapshot the normal window or probe its
 					// anchor against the alternate grid — not even for a toggle echo.
+					if (this.terminal.columns !== this.#altEnterWidth) {
+						// A width change reflows the alternate grid in place: cells of
+						// rows whose text survives byte-identical are still scrambled
+						// (wide glyphs split, tails detach), and the row differ would
+						// skip them. Invalidate the diff so the repaint is a true
+						// full frame at the new width.
+						this.#altPreviousLines = [];
+						this.#altPreparedRows = [];
+						this.#altEnterWidth = this.terminal.columns;
+						this.#altEnterHeight = this.terminal.rows;
+					}
 					this.requestRender(true);
 					return;
 				}
