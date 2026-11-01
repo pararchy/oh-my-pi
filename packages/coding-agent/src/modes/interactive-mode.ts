@@ -2286,7 +2286,24 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (requestRender) this.ui.requestRender();
 	}
 
+	#syncMcpHeader(): void {
+		if (!this.composer.fullscreen) return;
+		const manager = this.mcpManager;
+		const names = manager?.getAllServerNames() ?? [];
+		const parts = manager ? names.map(name => {
+			const cleanName = replaceTabs(sanitizeText(name)).replace(/[\r\n]+/g, " ");
+			const state = manager.getConnectionStatus(name);
+			const tools = manager.getConnection(name)?.tools;
+			return `${cleanName}: ${state}${state === "connected" && tools ? ` (${tools.length} listed)` : ""}`;
+		}) : [];
+		this.statusLine.setHookStatus("mcp", names.length
+			? `MCP ${names.length} servers · ${parts.join(" · ")}`
+			: "MCP none loaded");
+		this.ui.requestRender();
+	}
+
 	#handleMcpConnectionStatusEvent(event: McpConnectionStatusEvent): void {
+		this.#syncMcpHeader();
 		if (cfgStartupQuiet.get(this.settings)) return;
 		if (event.type === "connecting") {
 			this.#mcpStatusOrder = [];
@@ -2460,6 +2477,13 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.composer.setHeaderExtras(headerBefore, headerAfter);
 		this.statusLine.watchBranch(() => this.ui.requestRender());
 		this.composer.setStatusComponent(this.statusLine);
+		this.#syncMcpHeader();
+		if (this.composer.fullscreen && this.mcpManager) {
+			this.#eventBusUnsubscribers.push(
+				this.mcpManager.addConnectionStatusListener(() => this.#syncMcpHeader()),
+				this.mcpManager.addCatalogChangeListener(() => this.#syncMcpHeader()),
+			);
+		}
 
 		this.composer.setRuntimeChildren(
 			[
@@ -2489,6 +2513,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.hookWidgetContainerBelow,
 			],
 			{
+				fixedHeader: this.hookWidgetContainerAbove,
 				// Roots that collapse without new transcript output must not raise the
 				// post-run chrome floor: user-driven ones (editor drafts, dialogs and
 				// selectors, staged attachments, reports, queued messages, dismissible
@@ -4312,7 +4337,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		const shape = cfgComposerShape.get(settings);
 		const style = getComposerStyle(shape);
 		this.composer.setPreferences({ composerShape: shape });
-		this.statusLine.attachToEditor(this.editor, style);
+		this.statusLine.attachToEditor(this.editor, this.composer.fullscreen
+			? { statusAttachment: "none", bottomBar: "none", bottomBarGap: false }
+			: style);
 		this.updateEditorBorderColor();
 		this.#scheduleComposerStatusPersist();
 		this.ui.requestRender();
