@@ -3922,9 +3922,7 @@ export class TUI extends Container {
 		const wantAlt = topOverlay?.options?.fullscreen === true || this.#frameProvider?.fullscreen === true;
 		const wantMouse: MouseTrackingState =
 			topOverlay === undefined
-				? this.#frameProvider?.fullscreen
-					? "full"
-					: this.#inlineMouseProvider?.() === true ? "inline" : "off"
+				? this.#inlineMouseProvider?.() === true ? "inline" : "off"
 				: wantAlt && topOverlay.options?.mouseTracking !== false
 					? "full"
 					: "off";
