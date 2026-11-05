@@ -6,7 +6,7 @@ This document covers the **current** TUI contract used by `packages/coding-agent
 
 `PARA_OMP_LAYOUT=top` selects an alternate-screen, row-rendered viewport. The
 composer keeps extension widgets, status/HUDs, and interactive dialogs at the
-top; only the conversation scrolls (Page Up/Page Down; wheel with mouse capture enabled). The prompt
+top; only the conversation scrolls (Page Up/Page Down or ordinary mouse wheel). The prompt
 editor stays separate at the bottom, with its draft preserved across approval
 and ask dialogs. Enter/arrows answer the focused dialog, not the parked draft.
 
@@ -17,10 +17,11 @@ alternate-screen image pass. Native TSP negotiation is not used in this mode:
 its current surface contract has only a bottom dock. Without the environment
 flag, upstream rendering and input behavior are unchanged.
 
-The fixed-top frame does not force mouse reporting: `tui.mouse` remains opt-in,
-as in upstream mode. With capture off, terminal selection and ordinary
-click-to-clear remain native. Fullscreen modal pickers may capture their own
-mouse input, but closing them restores the chat's configured capture state.
+The fixed-top frame captures mouse input so wheel events can scroll its
+application-owned conversation; the alternate screen has no native scrollback.
+Use Shift+drag to select terminal text and Shift+click to clear that selection.
+`tui.mouse` remains opt-in for normal-buffer mode. Fullscreen modal pickers own
+their mouse input while open; closing them restores chat wheel reporting.
 
 
 ## What this subsystem is

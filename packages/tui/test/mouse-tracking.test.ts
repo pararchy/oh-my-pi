@@ -190,36 +190,6 @@ describe("inline mouse tracking", () => {
 			tui.stop();
 		}
 	});
-	it("restores native selection after closing a modal in fixed-top mode", () => {
-		const enabled = { current: false };
-		const { terminal, tui } = makeInlineTui(enabled);
-		tui.setFrameProvider({
-			fullscreen: true,
-			renderFrame: () => ({ viewport: ["selectable conversation"] }),
-			acknowledgeHistory() {},
-		});
-		try {
-			tui.start();
-			tui.renderNow();
-			expect(terminal.output).toContain("\x1b[?1049h");
-			expect(terminal.output).not.toContain(TRACKING_ON);
-			const modal = tui.showOverlay(new StaticOverlay(), { fullscreen: true });
-			tui.renderNow();
-			expect(terminal.output).toContain(TRACKING_ON);
-			modal.hide();
-			tui.renderNow();
-			expect(terminal.output.lastIndexOf(TRACKING_OFF)).toBeGreaterThan(terminal.output.lastIndexOf(TRACKING_ON));
-			expect(terminal.output).not.toContain("\x1b[?1049l");
-			enabled.current = true;
-			tui.renderNow();
-			expect(terminal.output.lastIndexOf(TRACKING_ON)).toBeGreaterThan(terminal.output.lastIndexOf(TRACKING_OFF));
-			enabled.current = false;
-			tui.renderNow();
-			expect(terminal.output.lastIndexOf(TRACKING_OFF)).toBeGreaterThan(terminal.output.lastIndexOf(TRACKING_ON));
-		} finally {
-			tui.stop();
-		}
-	});
 });
 
 describe("mutable viewport geometry", () => {

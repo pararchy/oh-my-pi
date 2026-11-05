@@ -103,12 +103,11 @@ const PAINT_BEGIN = `${HIDE_CURSOR}${SYNC_OUTPUT_BEGIN}${DISABLE_AUTOWRAP}`;
 const PAINT_END = `${ENABLE_AUTOWRAP}${SYNC_OUTPUT_END}`;
 const PAINT_BEGIN_NO_SYNC = `${HIDE_CURSOR}${DISABLE_AUTOWRAP}`;
 const PAINT_END_NO_SYNC = ENABLE_AUTOWRAP;
-// Mouse reporting is scoped to fullscreen overlays that opt into pointer
-// interaction, plus the opt-in normal-buffer click capture (`tui.mouse`).
+// Fullscreen views own wheel scrolling on the alternate screen, where native
+// scrollback is unavailable. Normal-buffer click capture is opt-in (`tui.mouse`).
 // 1000h = button click tracking, 1003h = any-motion tracking for hover
 // targets, and 1006h = SGR extended coordinates past column/row 223.
-// Selection-first surfaces leave these modes disabled so the terminal retains
-// native text selection.
+// Hold Shift to bypass capture for native terminal text selection.
 const MOUSE_TRACKING_ON = "\x1b[?1000h\x1b[?1003h\x1b[?1006h";
 const MOUSE_TRACKING_OFF = "\x1b[?1006l\x1b[?1003l\x1b[?1000l";
 // Cell-size replies: CSI 6 ; height ; width t in pixels, and iTerm2's
@@ -3922,7 +3921,9 @@ export class TUI extends Container {
 		const wantAlt = topOverlay?.options?.fullscreen === true || this.#frameProvider?.fullscreen === true;
 		const wantMouse: MouseTrackingState =
 			topOverlay === undefined
-				? this.#inlineMouseProvider?.() === true ? "inline" : "off"
+				? this.#frameProvider?.fullscreen === true
+					? "full"
+					: this.#inlineMouseProvider?.() === true ? "inline" : "off"
 				: wantAlt && topOverlay.options?.mouseTracking !== false
 					? "full"
 					: "off";

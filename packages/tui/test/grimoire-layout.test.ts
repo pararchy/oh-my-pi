@@ -6,6 +6,20 @@ import { TranscriptContainer } from "../src/chrome/transcript-container";
 import { GrimoireLayout } from "../src/prompt/grimoire-layout";
 import { initTheme } from "../src/theme/theme";
 import { visibleWidth } from "../src/utils";
+import { Composer } from "../src/prompt/composer";
+import { VirtualTerminal } from "./virtual-terminal";
+
+class WheelTerminal extends VirtualTerminal {
+	#reporting = false;
+	override write(data: string): void {
+		for (const match of data.matchAll(/\x1b\[\?1000([hl])/g)) this.#reporting = match[1] === "h";
+		super.write(data);
+	}
+	wheel(button: 64 | 65): void {
+		// A terminal sends wheel reports only while the application requests them.
+		if (this.#reporting) this.sendInput(`\x1b[<${button};20;10M`);
+	}
+}
 
 beforeAll(() => initTheme());
 
@@ -93,6 +107,52 @@ describe("Grimoire fixed-top viewport", () => {
 			expect(plain.at(-1)?.trimEnd()).toBe("parked draft");
 			expect(frame.every(row => visibleWidth(row) <= width)).toBe(true);
 			expect(frame.length).toBe(20);
+		}
+	});
+
+	it("receives wheel gestures before and after a picker without moving the header or editing the draft", () => {
+		const previousLayout = process.env.PARA_OMP_LAYOUT;
+		process.env.PARA_OMP_LAYOUT = "top";
+		const terminal = new WheelTerminal(80, 24);
+		const composer = new Composer({ terminal, preferences: { quiet: true } });
+		if (previousLayout === undefined) delete process.env.PARA_OMP_LAYOUT;
+		else process.env.PARA_OMP_LAYOUT = previousLayout;
+		const transcript = new TranscriptContainer();
+		for (let i = 1; i <= 80; i++) transcript.addChild(new PlainText(`message-${i}`, 0, 0));
+		const header = new PlainText("FIXED HEADER", 0, 0);
+		composer.editor.setText("unfinished draft");
+		composer.setRuntimeChildren([header, transcript, composer.editor], { fixedHeader: header });
+		composer.start({ playWelcomeIntro: false });
+		const paint = () => {
+			composer.ui.renderNow();
+			return terminal.getViewport();
+		};
+		try {
+			const tail = paint();
+			expect(tail.join("\n")).toContain("message-80");
+			terminal.wheel(64);
+			const earlier = paint();
+			expect(earlier.join("\n")).toContain("message-77");
+			expect(earlier.join("\n")).not.toContain("message-80");
+			expect(earlier[0]).toContain("FIXED HEADER");
+			expect(earlier[0]).toBe(tail[0]);
+			expect(composer.editor.getText()).toBe("unfinished draft");
+			terminal.wheel(65);
+			expect(paint()).toEqual(tail);
+
+			const picker = composer.ui.showOverlay(new PlainText("PICKER", 0, 0), {
+				fullscreen: true,
+				mouseTracking: false,
+			});
+			paint();
+			terminal.wheel(64);
+			picker.hide();
+			expect(paint()).toEqual(tail);
+			terminal.wheel(64);
+			expect(paint()).toEqual(earlier);
+			expect(composer.editor.getText()).toBe("unfinished draft");
+		} finally {
+			composer.stop();
 		}
 	});
 });
