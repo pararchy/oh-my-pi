@@ -720,3 +720,53 @@ describe("ExtensionUiController tool approval", () => {
 		expect(body()).toContain("rm-rf~");
 	});
 });
+
+describe("Grimoire parked drafts", () => {
+	it("navigates a session approval with a nonempty draft without submitting it", async () => {
+		const previous = process.env.PARA_OMP_LAYOUT;
+		process.env.PARA_OMP_LAYOUT = "top";
+		const now = vi.spyOn(performance, "now").mockReturnValue(1_000);
+		try {
+			const harness = makeHarness();
+			harness.editor.setText("unfinished message");
+			const submit = vi.fn();
+			harness.editor.onSubmit = submit;
+			const answer = harness.controller.showCollabAwareApproval({
+				full: "Allow tool: bash", compact: "Allow tool: bash", session: "Approve for this session",
+			});
+			now.mockReturnValue(2_000);
+			harness.handleInput("\x1b[B");
+			harness.handleInput("\r");
+			expect(await answer).toBe("session");
+			expect(harness.editor.getText()).toBe("unfinished message");
+			expect(submit).not.toHaveBeenCalled();
+		} finally {
+			now.mockRestore();
+			if (previous === undefined) delete process.env.PARA_OMP_LAYOUT;
+			else process.env.PARA_OMP_LAYOUT = previous;
+		}
+	});
+
+	it("answers a question while preserving the parked draft", async () => {
+		const previous = process.env.PARA_OMP_LAYOUT;
+		process.env.PARA_OMP_LAYOUT = "top";
+		try {
+			const harness = makeHarness();
+			harness.editor.setText("unfinished question");
+			const submit = vi.fn();
+			harness.editor.onSubmit = submit;
+			const answer = harness.controller.showAskDialog([
+				{ id: "choice", question: "Choose", options: [{ label: "Keep draft" }, { label: "Discard" }] },
+			]);
+			harness.handleInput("\r");
+			expect(await answer).toMatchObject({
+				kind: "submit", results: [{ id: "choice", selectedOptions: ["Keep draft"] }],
+			});
+			expect(harness.editor.getText()).toBe("unfinished question");
+			expect(submit).not.toHaveBeenCalled();
+		} finally {
+			if (previous === undefined) delete process.env.PARA_OMP_LAYOUT;
+			else process.env.PARA_OMP_LAYOUT = previous;
+		}
+	});
+});

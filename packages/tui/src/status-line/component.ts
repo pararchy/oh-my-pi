@@ -758,6 +758,10 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 	#promptCacheWakeAt: number | undefined;
 	#hookStatuses: Map<string, string> = new Map();
 	#sortedHookStatuses: readonly string[] = [];
+	#grimoireCache: {
+		source: CachedStatusLine;
+		rows: { left: string[]; right: string[]; below: string[] };
+	} | undefined;
 	#subagentCount: number = 0;
 	#runningSubagentIds = new Set<string>();
 	#subagentTreeCost = 0;
@@ -3657,6 +3661,48 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 	 */
 	renderBottomBar(width: number, groups: "left" | "full", previewTitle?: string): string {
 		return this.#buildStatusLine(width, groups === "left" ? "plain-left" : "plain-full", previewTitle).dimmedContent;
+	}
+
+	/** Fixed-top facts reuse the status cache and its existing VCS/usage refresh policy. */
+	renderGrimoire(width: number): { left: string[]; right: string[]; below: string[] } {
+		const source = this.#buildStatusLine(width, "plain-full");
+		if (this.#grimoireCache?.source === source) return this.#grimoireCache.rows;
+		const settings = this.#resolveSettings();
+		const segments = [...settings.leftSegments, ...settings.rightSegments];
+		const gitEnabled = this.#gitEnabled();
+		const ctx = this.#buildSegmentContext(
+			width, settings.segmentOptions, hasPathSegment(segments),
+			gitEnabled && hasGitSegment(segments), gitEnabled && hasPrSegment(segments), Date.now(),
+		);
+		const rows = { left: [] as string[], right: [] as string[], below: [] as string[] };
+		for (const id of new Set(segments)) {
+			// The spirit supplies the brand; hook statuses are placed separately.
+			if (id === "pi" || id === "status") continue;
+			const rendered = renderSegment(id, ctx);
+			if (!rendered.visible || !rendered.content) continue;
+			const side = id === "model" || id === "path" || id === "git" || id === "pr" ? rows.left : rows.right;
+			side.push(truncateToWidth(this.#dimWhileFocusProxied(rendered.content), width));
+		}
+		const badge = this.#subagentBadgeText();
+		if (badge) rows.right.push(badge);
+		const jobs = this.runningBackgroundJobCount();
+		if (jobs) rows.right.push(theme.fg("statusLineSubagents", `${theme.icon.job} ${jobs}`));
+		if (this.#settings.showHookStatus ?? true) {
+			for (const [key, text] of this.#hookStatuses) {
+				const clean = sanitizeHookStatusText(text);
+				if (key === "spirit") {
+					const parts = clean.split(" · ");
+					rows.right.push(truncateToWidth(parts.splice(0, 2).join(" · "), width));
+					rows.right.push(...parts
+						.filter(part => !part.startsWith("ctx ") || !hasContextSegment(segments))
+						.map(part => truncateToWidth(part, width)));
+				} else if (key === "mcp") {
+					rows.right.push(...clean.split(" · ").map(part => truncateToWidth(part, width)));
+				} else rows.below.push(clean);
+			}
+		}
+		this.#grimoireCache = { source, rows };
+		return rows;
 	}
 	/**
 	 * Status bar lines for a composer layout, rendered through the real

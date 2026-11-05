@@ -236,6 +236,13 @@
 - Fixed `read` of a whole URL returning no content when the page's first line is over the 50 KB output budget, as on minified pages read with `:raw`; it now shows that line's first 50 KB ([#17500](https://github.com/can1357/oh-my-pi/pull/17500) by [@will-bogusz](https://github.com/will-bogusz))
 - Fixed an advisor whose usage-limited account kept being reported as switchable retrying the same capped account thousands of times; it now tries each sibling account at most once per provider per failing review, then falls back, waits, or pauses on the quota ([#17472](https://github.com/can1357/oh-my-pi/issues/17472))
 - Fixed LSP definition, type definition, implementation and reference results carrying a stray carriage return on every source context line from files with Windows (CRLF) line endings ([#17549](https://github.com/can1357/oh-my-pi/pull/17549) by [@JustasMasiulis](https://github.com/JustasMasiulis))
+### Grimoire personal fork
+
+- Added opt-in fixed-top persona/status/dialog chrome with a separately scrolling conversation and parked prompt editor (`PARA_OMP_LAYOUT=top`).
+- Approval and ask-dialog navigation no longer submits a nonempty parked draft in Grimoire mode.
+- Kept terminal image budgeting and cursor rendering inside the fullscreen lifecycle; upstream default mode remains unchanged.
+- Restored ordinary mouse-wheel scrolling in fixed-top chat, including after closing fullscreen pickers. Terminal text selection uses Shift+drag / Shift+click; normal-buffer mouse capture remains opt-in.
+
 
 ## [18.14.1] - 2026-10-31
 

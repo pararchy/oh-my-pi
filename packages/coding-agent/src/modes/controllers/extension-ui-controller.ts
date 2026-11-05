@@ -759,7 +759,8 @@ export class ExtensionUiController {
 										onGrant: (grant, always) => settle(always ? grant.alwaysLabel : grant.label),
 									}
 								: {}),
-							draft: {
+							// A permission answer must never submit the parked message draft.
+							draft: process.env.PARA_OMP_LAYOUT === "top" ? undefined : {
 								hasDraft: () =>
 									editor.getText().length > 0 || editor.pendingImages.length > 0 || editor.pasteInFlight,
 								handleInput: keyData => editor.handleDraftEdit(keyData),
@@ -772,7 +773,7 @@ export class ExtensionUiController {
 					this.ctx.editorContainer.addChild(editor);
 					this.ctx.ui.setFocus(dialog);
 					// The dialog owns focus but forwards typing: keep the composer's cursor visible.
-					editor.focused = true;
+					editor.focused = process.env.PARA_OMP_LAYOUT !== "top";
 					// Its submissions steer this (main) session, even from a focused agent's view.
 					this.ctx.approvalOwnsComposer = true;
 					this.ctx.ui.requestRender();
@@ -833,7 +834,7 @@ export class ExtensionUiController {
 			// typing never answers by accident; up/down hand input to the ask and the
 			// draft stays parked beneath it until the ask closes.
 			const inputGuard =
-				draftEditor.getText().length > 0
+				process.env.PARA_OMP_LAYOUT !== "top" && draftEditor.getText().length > 0
 					? {
 							isBlocked: () => draftEditor.getText().length > 0,
 							handleInput: (keyData: string) => draftEditor.handleDraftEdit(keyData),

@@ -27,6 +27,8 @@ import type { WordCompletionMethod } from "./word-completion";
 import { type AnimationFrame, TranscriptContainer } from "../chrome/transcript-container";
 import { type VersionUpdate, WelcomeComponent } from "./welcome";
 import { ensureThemeSync, getEditorTheme, theme } from "../theme/theme";
+import { GrimoireLayout } from "./grimoire-layout";
+import { matchesKey } from "../keys";
 
 const DOUBLE_INTERRUPT_MS = 500;
 // How long idle chrome must hold its height after a turn before it is treated as permanent.
@@ -98,6 +100,8 @@ export interface ComposerOptions {
 
 /** How {@link Composer.setRuntimeChildren} lays out the roots below the transcript. */
 export interface RuntimeChildrenOptions {
+	/** Persona widget band used as the center of the fixed-top header. */
+	readonly fixedHeader?: Component;
 	/**
 	 * Dock order on a TSP terminal (no status strip; the composer carries its
 	 * facts): the native dock stacks HUD pills, the working row and queued messages over
@@ -147,14 +151,18 @@ export interface ComposerStartOptions {
  * status line's facts ({@link StatusLineComponent.describeComposerFacts}).
  */
 class StatusHost implements Component {
-	#component: Component | undefined;
+	#component: Pick<StatusLineComponent, "render" | "renderGrimoire"> | undefined;
 
-	setComponent(component: Component): void {
+	setComponent(component: Pick<StatusLineComponent, "render" | "renderGrimoire">): void {
 		this.#component = component;
 	}
 
 	render(width: number): readonly string[] {
 		return this.#component?.render(width) ?? [];
+	}
+
+	renderGrimoire(width: number) {
+		return this.#component?.renderGrimoire(width);
 	}
 }
 
@@ -221,6 +229,8 @@ function rowTargetCandidates(target: Component): ((local: number) => string[]) |
  */
 export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 	readonly ui: TUI;
+	readonly fullscreen = process.env.PARA_OMP_LAYOUT === "top";
+	readonly #grimoire = new GrimoireLayout();
 	#editor: CustomEditor;
 	readonly #header = new Container();
 	readonly #bootstrapInputGap = new Spacer(1);
@@ -234,6 +244,7 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 	#headerBefore: readonly Component[] = [];
 	#headerAfter: readonly Component[] = [];
 	#runtimeChildren: readonly Component[] = [];
+	#fixedHeader: Component | undefined;
 	#nativeDock: readonly Component[] | undefined;
 	#nativeTail: readonly Container[] = [];
 	/** Cache-driven status line shown until {@link setStatusComponent} mounts the session's. */
@@ -397,6 +408,17 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		// A settle timer that fires while the TUI is stopped (external editor, suspend) is dropped;
 		// forget it on restart so the next frame re-arms instead of waiting on it forever.
 		this.ui.addStartListener(() => this.#resetIdleChrome());
+		this.ui.addInputListener(data => {
+			if (!this.fullscreen || this.ui.hasOverlay() || this.ui.getFocused() !== this.editor) return;
+			const wheel = /^\x1b\[<(\d+);\d+;\d+[Mm]$/.exec(data);
+			if (matchesKey(data, "pageUp") || wheel?.[1] === "64") {
+				this.#grimoire.scroll(wheel ? 3 : this.#grimoire.pageRows);
+			} else if (matchesKey(data, "pageDown") || wheel?.[1] === "65") {
+				this.#grimoire.scroll(-(wheel ? 3 : this.#grimoire.pageRows));
+			} else return;
+			this.ui.requestRender();
+			return { consume: true };
+		}, { prepend: true });
 	}
 	/**
 	 * Rows the below-transcript chrome under `root` (editor, status line, …)
@@ -420,6 +442,9 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		const roots = this.#runtimeMounted
 			? [...this.#runtimeChildren, this.#statusHost]
 			: [this.#header, this.#bootstrapInputGap, this.editor, this.#statusHost];
+		if (this.fullscreen) {
+			return { viewport: this.#grimoire.render(roots, this.editor, width, rows, this.#fixedHeader, this.#statusHost) };
+		}
 		const transcriptIndex = roots.findIndex(root => root instanceof TranscriptContainer);
 		if (transcriptIndex < 0) {
 			this.#lastClickSpans = [];
@@ -1174,7 +1199,11 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		this.#chromeFloorPromoted = false;
 		this.#resetIdleChrome();
 		this.#nativeDock = options.nativeDock;
+<<<<<<< Updated upstream
 		this.#nativeTail = options.nativeTail ?? [];
+=======
+		this.#fixedHeader = options.fixedHeader;
+>>>>>>> Stashed changes
 		this.#transientChrome = new Set(options.transientChrome);
 		this.#selfClearingChrome = new Set(options.selfClearingChrome);
 		this.#transientFloor = undefined;
