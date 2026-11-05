@@ -1199,11 +1199,8 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		this.#chromeFloorPromoted = false;
 		this.#resetIdleChrome();
 		this.#nativeDock = options.nativeDock;
-<<<<<<< Updated upstream
 		this.#nativeTail = options.nativeTail ?? [];
-=======
 		this.#fixedHeader = options.fixedHeader;
->>>>>>> Stashed changes
 		this.#transientChrome = new Set(options.transientChrome);
 		this.#selfClearingChrome = new Set(options.selfClearingChrome);
 		this.#transientFloor = undefined;
