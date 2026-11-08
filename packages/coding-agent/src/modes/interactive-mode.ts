@@ -114,6 +114,7 @@ import type { GoalModeState } from "../goals/state";
 import { rebindMemoryBackendForCwd } from "../hindsight/backend";
 import { copyLocalArtifacts, resolveLocalRoot } from "../internal-urls";
 import { hasNativeJudge } from "../judgment";
+import type { LiveEngine } from "../live/settings";
 import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "../lsp/startup-events";
 import type { MCPManager } from "../mcp";
 import {
@@ -9458,14 +9459,14 @@ export class InteractiveMode implements InteractiveModeContext {
 		return undefined;
 	}
 
-	/** Start or stop the Codex-backed realtime voice surface. */
-	async handleLiveCommand(): Promise<void> {
+	/** Start or stop the realtime voice surface; `engine` overrides `live.engine` for this call. */
+	async handleLiveCommand(engine?: LiveEngine): Promise<void> {
 		const blocker = this.#liveStartBlocker();
 		if (blocker) {
 			this.showWarning(blocker);
 			return;
 		}
-		await this.#liveCommandController.handleCommand();
+		await this.#liveCommandController.handleCommand(engine);
 	}
 
 	/** Start a live session whose audio runs on an extension's own WebRTC peer. */

@@ -1,6 +1,7 @@
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { logger, toError } from "@oh-my-pi/pi-utils";
 import { LiveSessionController, type LiveSessionControllerOptions, type LiveTranscript } from "../../live/controller";
+import { LocalLiveSessionController } from "../../live/local-controller";
 import { LIVE_MODEL } from "../../live/protocol";
 import { LiveVisualizer } from "@oh-my-pi/pi-tui/apps/live-visualizer";
 import { vocalizer } from "../../tts/vocalizer";
@@ -11,12 +12,16 @@ import type { InteractiveModeContext } from "../types";
 import { createAssistantMessageComponent } from "@oh-my-pi/pi-tui/prompt/interactive-context-helpers";
 
 import type { ExtensionLiveSession, ExtensionLiveStartOptions } from "../../extensibility/extensions/types";
-import { resolveLiveVoice } from "../../live/settings";
+import { cfgLiveEngine, resolveLiveVoice, type LiveEngine } from "../../live/settings";
 
 const ANIMATION_INTERVAL_MS = 80;
-type LiveSessionFactory = (options: LiveSessionControllerOptions) => LiveSessionController;
+
+/** One live call regardless of backend: Codex realtime or the local STT→session→TTS loop. */
+export type LiveCall = Pick<LiveSessionController, "start" | "stop" | "toggleMute" | "phase" | "muted" | "sdpAnswer">;
+
+type LiveSessionFactory = (options: LiveSessionControllerOptions) => LiveCall;
 /** A started session, or the connect failure `#finish` has already shown and cleaned up. */
-type LiveStartOutcome = { session: LiveSessionController } | { error: Error };
+type LiveStartOutcome = { session: LiveCall } | { error: Error };
 
 const LIVE_MESSAGE_USAGE: AssistantMessage["usage"] = {
 	input: 0,
@@ -41,7 +46,7 @@ export class LiveCommandController {
 	readonly #ctx: InteractiveModeContext;
 	readonly #createSession: LiveSessionFactory | undefined;
 
-	#session: LiveSessionController | undefined;
+	#session: LiveCall | undefined;
 	#settling: Promise<void> | undefined;
 	#visualizer: LiveVisualizer | undefined;
 	#detachedEditor: CustomEditor | undefined;
@@ -63,8 +68,8 @@ export class LiveCommandController {
 		return this.#session !== undefined || this.#settling !== undefined;
 	}
 
-	/** Start live mode, or stop the currently active session. */
-	async handleCommand(): Promise<void> {
+	/** Start live mode, or stop the currently active session. `engine` overrides `live.engine` for this call. */
+	async handleCommand(engineOverride?: LiveEngine): Promise<void> {
 		if (this.#session) {
 			await this.stop();
 			return;
@@ -73,7 +78,8 @@ export class LiveCommandController {
 		// Another start may have claimed the slot while the previous session finished closing.
 		if (this.#session) return;
 		// A connect failure was already shown; anything else (factory, mounting) propagates.
-		await this.#start(resolveLiveVoice(this.#ctx.settings));
+		const engine = engineOverride ?? cfgLiveEngine.get(this.#ctx.settings);
+		await this.#start(resolveLiveVoice(this.#ctx.settings), { engine });
 	}
 
 	/**
@@ -87,7 +93,7 @@ export class LiveCommandController {
 		}
 		while (this.#settling) await this.#settling;
 		const voice = resolveLiveVoice(this.#ctx.settings, options.voice);
-		const outcome = await this.#start(voice, options);
+		const outcome = await this.#start(voice, { remote: options, engine: "codex" });
 		if ("error" in outcome) throw outcome.error;
 		const { session } = outcome;
 		const stop = async (): Promise<void> => {
@@ -135,7 +141,10 @@ export class LiveCommandController {
 	 * Starts a session. A connect failure is shown, cleaned up and returned; the slot check and
 	 * claim (`#session = session`) run synchronously, so concurrent starts cannot both win.
 	 */
-	async #start(voice: string, remote?: ExtensionLiveStartOptions): Promise<LiveStartOutcome> {
+	async #start(
+		voice: string,
+		{ remote, engine }: { remote?: ExtensionLiveStartOptions; engine: LiveEngine },
+	): Promise<LiveStartOutcome> {
 		if (this.#session) throw new Error("A live session is already active");
 		this.#assistantTranscriptTurn = 0;
 		this.#assistantTranscriptStartedAt = 0;
@@ -186,9 +195,13 @@ export class LiveCommandController {
 				},
 			},
 		};
-		let session: LiveSessionController;
+		let session: LiveCall;
 		try {
-			session = this.#createSession ? this.#createSession(options) : new LiveSessionController(options);
+			session = this.#createSession
+				? this.#createSession(options)
+				: engine === "local"
+					? new LocalLiveSessionController(options)
+					: new LiveSessionController(options);
 		} catch (cause) {
 			// No session to finish: put the editor back before the failure propagates.
 			this.#restoreEditor();
@@ -281,7 +294,7 @@ export class LiveCommandController {
 		this.#ctx.ui.requestRender();
 	}
 
-	#finish(session: LiveSessionController, error?: Error): void {
+	#finish(session: LiveCall, error?: Error): void {
 		if (this.#session !== session) return;
 		this.#session = undefined;
 		this.#restoreEditor();

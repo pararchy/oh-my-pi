@@ -29,6 +29,7 @@ import type {
 	PlanReviewRequestedEvent,
 } from "../extensibility/extensions/types";
 import type { Skill } from "../extensibility/skills";
+import type { LiveEngine } from "../live/settings";
 import type { MCPManager } from "../mcp";
 import type { PlanApprovalDetails } from "../plan-mode/approved-plan";
 import type { AgentSession } from "../session/agent-session";
@@ -600,8 +601,8 @@ export interface InteractiveModeContext {
 	/** Space-bar push-to-talk into `target`: a recognized hold starts dictation and its release stops
 	 *  it. Gated on `stt.enabled`, so a disabled STT leaves the space bar typing normally. */
 	dictationSpaceHold(target: DictationTarget): SpaceHoldHandler;
-	/** Start or stop the Codex-backed realtime voice session. */
-	handleLiveCommand(): Promise<void>;
+	/** Start or stop the realtime voice session; `engine` overrides `live.engine` for this call. */
+	handleLiveCommand(engine?: LiveEngine): Promise<void>;
 	/** Start a live session whose audio runs on an extension's own WebRTC peer (`ctx.startLive`). */
 	startRemoteLive(options: ExtensionLiveStartOptions): Promise<ExtensionLiveSession>;
 	/** Start a `/record` screen capture, or stop the running one. */

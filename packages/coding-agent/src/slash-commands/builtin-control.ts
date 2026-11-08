@@ -93,10 +93,13 @@ export const BUILTIN_CONTROL_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 	{
 		name: "live",
 		icon: "voice",
-		description: "Start Codex-backed realtime voice mode",
-		handleTui: async (_command, runtime) => {
+		description: "Start realtime voice mode — `/live [codex|local]` picks the engine for this call",
+		allowArgs: true,
+		handleTui: async (command, runtime) => {
+			const arg = command.args.trim().toLowerCase();
+			const engine = arg === "local" || arg === "codex" ? arg : undefined;
 			clearSubmittedText(runtime);
-			await runtime.ctx.handleLiveCommand();
+			await runtime.ctx.handleLiveCommand(engine);
 		},
 	},
 	{
