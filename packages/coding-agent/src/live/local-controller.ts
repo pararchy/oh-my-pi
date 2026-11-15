@@ -1,39 +1,36 @@
 /**
- * Local voice engine for `/live` — mic → local STT → the session's own turn →
- * local Kokoro TTS. Unlike the Codex realtime path there is no remote model: the
- * SAME AgentSession answers, so the persona, tools and transcript are shared with
- * text mode. A spoken prompt while the agent is streaming steers the running
- * turn; tool work never aborts on user speech.
- *
- * Echo: while speech is playing the mic is gated unless input stays clearly loud
- * for {@link BARGE_IN_STREAK} chunks (headphones make this irrelevant; on
- * speakers it is a deliberate talk-over). Utterances that outlive a
- * {@link SEGMENT_MERGE_MS} pause are submitted as one turn so mid-thought pauses
- * do not split prompts.
+ * Local speech recognition and Kokoro playback around the session's configured
+ * reasoning model (which may be remote). Only finalized STT segments become
+ * prompts; previews remain volatile. A finalized utterance during work aborts
+ * the in-flight turn and becomes a fresh turn — the voice equivalent of Esc
+ * then typing — so a voice user is never made to wait for a long answer or a
+ * long tool batch. Echo gating is an energy heuristic, not AEC.
  */
 import type { AgentSessionEvent } from "../session/agent-session-events";
 import type { AgentSession } from "../session/agent-session";
 import { AudioCapture } from "@oh-my-pi/pi-natives";
-import { logger, toError } from "@oh-my-pi/pi-utils";
+import { toError } from "@oh-my-pi/pi-utils";
 import type { LivePhase } from "@oh-my-pi/pi-tui/apps/live-visualizer";
 import { resolveRoleChain } from "../config/model-resolver";
 import { roleCandidatePool } from "../config/model-roles";
 import { DEFAULT_STT_MODEL_KEY, resolveSttModelSpec, type SttModelKey } from "../stt/models";
 import { isSttModelCached, downloadSttModel } from "../stt/downloader";
 import { sttClient, type SttStreamHandle } from "../stt/asr-client";
+import { cfgSttLanguage } from "../stt/settings";
 import { isTtsModelCached, downloadTtsModel } from "../tts/downloader";
 import { resolveLocalSpeechModelId, Vocalizer } from "../tts/vocalizer";
 import { TTS_LOCAL_VOICE_VALUES } from "../tts/models";
 import { SpeechEnhancer } from "../tts/speech-enhancer";
-import { cfgLiveLocalVoice, cfgLivePersonality } from "./settings";
+import { cfgLiveLocalVoice, cfgLiveMicThreshold, cfgLivePersonality } from "./settings";
+import { LiveInputGate } from "./input-gate";
 import type { LiveSessionControllerOptions, LiveTranscript } from "./controller";
 
 /** Quiet span after a committed segment before the utterance submits as a turn. */
 const SEGMENT_MERGE_MS = 900;
 /** RMS floor that must be sustained to count as a barge-in while speech plays. */
 const BARGE_IN_LEVEL = 0.05;
-/** Consecutive ~64 ms chunks above the floor before barge-in trips (~250 ms). */
-const BARGE_IN_STREAK = 4;
+/** Barge-in duration is measured in PCM samples, independent of callback size. */
+const BARGE_IN_SAMPLES = 4_000;
 /** Quiet span after playback ends before mic gating drops (~echo ring-down). */
 const ECHO_RELEASE_MS = 350;
 /** Assistant-speech phase poll; isSpeaking() is cheap so this can run fast. */
@@ -68,7 +65,15 @@ export type LiveSpeechSink = Pick<
 
 /** Injectable seams for tests: capture chunks, STT segments and speech playback. */
 export interface LocalLiveDeps {
-	startStream(options: { onPartial(text: string): void; onSegment(text: string): void }): SttStreamHandle;
+	startStream(options: {
+		onPartial(text: string): void;
+		onSegment(text: string): void;
+		language?: string;
+		speechDetection?: "energy" | "silero";
+		onSpeech?(active: boolean): void;
+		onError?(error: Error): void;
+		onDetector?(detector: "energy" | "silero"): void;
+	}): SttStreamHandle;
 	startCapture(onAudio: (samples: Float32Array) => void): { stop(): void };
 	createVocalizer(): LiveSpeechSink;
 	/** Utterance merge window; tests shrink it. Defaults to {@link SEGMENT_MERGE_MS}. */
@@ -79,6 +84,19 @@ export class LocalLiveSessionController {
 	readonly #deps: LocalLiveDeps | undefined;
 	readonly #session: AgentSession;
 	readonly #callbacks: LiveSessionControllerOptions["callbacks"];
+	readonly #inputGate: LiveInputGate;
+	readonly #micThreshold: number;
+	readonly #startupAbort = new AbortController();
+	#modelKey: SttModelKey | undefined;
+	#streamGeneration = 0;
+	#hasUtterance = false;
+	#awaitingFinal = false;
+	#speechInterrupted = false;
+	/** Latest detector state; true while the VAD holds a speech run open. */
+	#vadSpeechActive = false;
+	/** Resolved detector for the active stream; `"energy"` disables VAD gating. */
+	#detector: "energy" | "silero" = "energy";
+	#silence = new Float32Array(0);
 
 	#recorder: AudioCapture | undefined;
 	#captureHandle: { stop(): void } | undefined;
@@ -101,14 +119,15 @@ export class LocalLiveSessionController {
 	#phaseTicker: NodeJS.Timeout | undefined;
 	/** Chunks kept while speech plays so a barge-in keeps its first words. */
 	#bargeBuffer: Float32Array[] = [];
-	#bargeStreak = 0;
+	#bargeSamples = 0;
 	#speakReleaseAt = 0;
-	#emitQueue: Promise<void> = Promise.resolve();
 
 	constructor(options: LiveSessionControllerOptions & { deps?: LocalLiveDeps }) {
 		this.#session = options.session;
 		this.#deps = options.deps;
 		this.#callbacks = options.callbacks;
+		this.#micThreshold = cfgLiveMicThreshold.get(this.#session.settings);
+		this.#inputGate = new LiveInputGate({ threshold: this.#micThreshold });
 	}
 
 	get phase(): LivePhase {
@@ -136,8 +155,9 @@ export class LocalLiveSessionController {
 
 		try {
 			const modelKey = this.#resolveSttModelKey();
+			this.#modelKey = modelKey;
 			if (!this.#deps && !(await isSttModelCached(modelKey))) {
-				await downloadSttModel(modelKey, undefined);
+				await downloadSttModel(modelKey, undefined, { signal: this.#startupAbort.signal });
 			}
 			if (this.#stopped) throw this.#failure ?? new Error("The live session stopped while starting.");
 
@@ -166,8 +186,15 @@ export class LocalLiveSessionController {
 					registry: this.#session.modelRegistry,
 				});
 				if (!(await isTtsModelCached(ttsModelKey))) {
-					await downloadTtsModel(ttsModelKey);
+					if (!(await downloadTtsModel(ttsModelKey, undefined, this.#startupAbort.signal))) {
+						throw new Error("Local speech synthesis model setup failed.");
+					}
 				}
+			}
+			// Warm the neural speech detector so its ~2 MB model is cached before
+			// the first call. Failure is non-fatal: barge-in falls back to energy.
+			if (!this.#deps) {
+				await sttClient.prepareVad(modelKey, { signal: this.#startupAbort.signal }).catch(() => {});
 			}
 			if (this.#stopped) throw this.#failure ?? new Error("The live session stopped while starting.");
 
@@ -180,25 +207,20 @@ export class LocalLiveSessionController {
 				display: false,
 				attribution: "user",
 			});
+			if (this.#stopped) throw this.#failure ?? new Error("The live session stopped while starting.");
 
 			this.#unsubscribeSession = this.#session.subscribe(event =>
 				this.#guardEvent(() => this.#handleSessionEvent(event)),
 			);
 
-			this.#stream = this.#deps
-				? this.#deps.startStream({
-						onPartial: text => this.#guardEvent(() => this.#handlePartial(text)),
-						onSegment: text => this.#guardEvent(() => this.#handleSegment(text)),
-					})
-				: sttClient.startStream(modelKey, {
-						onPartial: text => this.#guardEvent(() => this.#handlePartial(text)),
-						onSegment: text => this.#guardEvent(() => this.#handleSegment(text)),
-					});
+			if (!this.#muted) this.#openStream();
 
 			if (this.#deps) {
-				this.#captureHandle = this.#deps.startCapture(samples =>
+				const capture = this.#deps.startCapture(samples =>
 					this.#guardEvent(() => this.#handleMicrophoneAudio(samples)),
 				);
+				if (this.#stopped) capture.stop();
+				else this.#captureHandle = capture;
 			} else {
 				const recorder = new AudioCapture(SAMPLE_RATE, (error, samples) => {
 					if (error) {
@@ -217,27 +239,88 @@ export class LocalLiveSessionController {
 				}
 				this.#recorder = recorder;
 			}
+			if (this.#stopped) throw this.#failure ?? new Error("The live session stopped while starting.");
 			this.#phaseTicker = setInterval(() => this.#guardEvent(() => this.#refreshPhase()), PHASE_TICK_MS);
 			this.#phaseTicker.unref?.();
 			this.#refreshPhase();
 		} catch (cause) {
 			const error = toError(cause);
-			this.#reportFailure(error);
+			if (!this.#stopped) this.#reportFailure(error);
 			await this.stop();
 			throw error;
 		}
 	}
 
+	#openStream(): void {
+		const modelKey = this.#modelKey;
+		if (!modelKey || this.#stopped || this.#muted) return;
+		const generation = ++this.#streamGeneration;
+		this.#vadSpeechActive = false;
+		this.#detector = "energy";
+		const options = {
+			language: cfgSttLanguage.get(this.#session.settings) || undefined,
+			speechDetection: "silero" as const,
+			onDetector: (detector: "energy" | "silero") => {
+				if (generation === this.#streamGeneration && !this.#muted) {
+					this.#guardEvent(() => {
+						this.#detector = detector;
+					});
+				}
+			},
+			onSpeech: (active: boolean) => {
+				if (generation === this.#streamGeneration && !this.#muted) {
+					this.#guardEvent(() => this.#handleSpeechActivity(active));
+				}
+			},
+			onError: (error: Error) => {
+				if (generation === this.#streamGeneration && !this.#muted) {
+					this.#guardEvent(() => this.#reportFailure(error));
+				}
+			},
+			onPartial: (text: string) => {
+				if (generation === this.#streamGeneration && !this.#muted) {
+					this.#guardEvent(() => this.#handlePartial(text));
+				}
+			},
+			onSegment: (text: string) => {
+				if (generation === this.#streamGeneration && !this.#muted) {
+					this.#guardEvent(() => this.#handleSegment(text));
+				}
+			},
+		};
+		const stream = this.#deps ? this.#deps.startStream(options) : sttClient.startStream(modelKey, options);
+		if (this.#stopped || this.#muted || generation !== this.#streamGeneration) stream.cancel();
+		else this.#stream = stream;
+	}
+
+	#resetInput(): void {
+		this.#clearSubmitTimer();
+		this.#utteranceParts = [];
+		this.#partial = "";
+		this.#hasUtterance = false;
+		this.#awaitingFinal = false;
+		this.#inputGate.reset();
+		this.#bargeSamples = 0;
+		this.#bargeBuffer = [];
+		this.#cancelInterruptedSubmit();
+	}
+
 	toggleMute(): void {
 		if (this.#stopped) return;
 		this.#muted = !this.#muted;
-		if (this.#muted) {
-			this.#utteranceParts = [];
-			this.#partial = "";
-			this.#clearSubmitTimer();
-			this.#emitTranscript(undefined);
-			this.#emitLevels(0, this.#outputLevel());
-		}
+		this.#guardEvent(() => {
+			if (this.#muted) {
+				this.#streamGeneration += 1;
+				const stream = this.#stream;
+				this.#stream = undefined;
+				this.#resetInput();
+				stream?.cancel();
+				this.#emitTranscript(undefined);
+				this.#emitLevels(0, this.#outputLevel());
+			} else {
+				this.#openStream();
+			}
+		});
 		this.#refreshPhase();
 	}
 
@@ -248,7 +331,9 @@ export class LocalLiveSessionController {
 
 	async #stop(): Promise<void> {
 		this.#stopped = true;
-		this.#clearSubmitTimer();
+		this.#startupAbort.abort();
+		this.#streamGeneration += 1;
+		this.#resetInput();
 		if (this.#phaseTicker) {
 			clearInterval(this.#phaseTicker);
 			this.#phaseTicker = undefined;
@@ -292,65 +377,103 @@ export class LocalLiveSessionController {
 	// --- Microphone and echo gate -------------------------------------------
 
 	#handleMicrophoneAudio(samples: Float32Array): void {
-		if (this.#stopped) return;
-		const stream = this.#stream;
-		if (!stream) return;
+		if (this.#stopped || this.#muted || !this.#stream || samples.length === 0) return;
 		const level = microphoneLevel(samples);
 		const speaking = this.#vocalizer?.isSpeaking() ?? false;
 		if (speaking) this.#speakReleaseAt = Date.now() + ECHO_RELEASE_MS;
-
-		if (this.#muted) {
-			this.#emitLevels(0, speaking ? 0.4 : 0);
-			return;
-		}
 		this.#emitLevels(level, speaking ? 0.4 : 0);
-
-		const gated = speaking || Date.now() < this.#speakReleaseAt;
-		if (!gated) {
-			this.#bargeStreak = 0;
-			stream.pushAudio(samples);
+		// The detector hears every mic frame, including playback; the energy gate
+		// alone decides what reaches the recognizer.
+		this.#stream?.pushDetect(samples);
+		if (!speaking && Date.now() >= this.#speakReleaseAt) {
+			this.#bargeSamples = 0;
+			this.#bargeBuffer = [];
+			this.#inputGate.push(samples, this.#pushRecognizedAudio);
 			return;
 		}
 
-		// While speech plays, input only reaches the STT as a sustained loud run —
-		// speaker bleed sits below the floor unless the user talks over the agent.
+		// Playback exclusion: energy prefilters sustained loud input; the neural
+		// detector confirms speech before playback is interrupted (see
+		// #handleSpeechActivity). Preserve the onset in owned PCM.
+		this.#inputGate.reset();
 		if (level >= BARGE_IN_LEVEL) {
-			this.#bargeBuffer.push(samples);
-			if (this.#bargeBuffer.length > BARGE_IN_STREAK * 2) this.#bargeBuffer.shift();
-			this.#bargeStreak += 1;
-			if (this.#bargeStreak === BARGE_IN_STREAK) {
+			const buffered = samples.slice(0, BARGE_IN_SAMPLES);
+			this.#bargeBuffer.push(buffered);
+			this.#bargeSamples += buffered.length;
+			// VAD confirmation is required only when the neural detector resolved;
+			// on fallback the energy heuristic keeps its original behavior.
+			if (this.#bargeSamples >= BARGE_IN_SAMPLES && (this.#detector !== "silero" || this.#vadSpeechActive)) {
 				this.#vocalizer?.clear();
+				this.#speechInterrupted = true;
 				this.#speakReleaseAt = 0;
-				for (const buffered of this.#bargeBuffer) stream.pushAudio(buffered);
+				for (const chunk of this.#bargeBuffer) this.#inputGate.push(chunk, this.#pushRecognizedAudio);
 				this.#bargeBuffer = [];
-			} else {
-				stream.pushAudio(new Float32Array(samples.length));
+				this.#bargeSamples = 0;
+				return;
 			}
-			return;
+		} else {
+			this.#bargeSamples = 0;
+			this.#bargeBuffer = [];
 		}
-		this.#bargeStreak = 0;
-		this.#bargeBuffer = [];
-		stream.pushAudio(new Float32Array(samples.length));
+		if (this.#silence.length !== samples.length) this.#silence = new Float32Array(samples.length);
+		this.#stream?.pushAudio(this.#silence);
 	}
+
+	#handleSpeechActivity(active: boolean): void {
+		this.#vadSpeechActive = active;
+		if (!active) return;
+		const speaking = (this.#vocalizer?.isSpeaking() ?? false) || Date.now() < this.#speakReleaseAt;
+		if (speaking && this.#bargeSamples >= BARGE_IN_SAMPLES) {
+			this.#vocalizer?.clear();
+			this.#speechInterrupted = true;
+			this.#speakReleaseAt = 0;
+			for (const chunk of this.#bargeBuffer) this.#inputGate.push(chunk, this.#pushRecognizedAudio);
+			this.#bargeBuffer = [];
+			this.#bargeSamples = 0;
+		}
+	}
+
+	/** Stable callback: IPC consumes emitted frames synchronously. */
+	readonly #pushRecognizedAudio = (audio: Float32Array): void => {
+		if (this.#stopped || this.#muted || !this.#stream) return;
+		if (this.#inputGate.active && microphoneLevel(audio) >= this.#micThreshold) {
+			this.#awaitingFinal = true;
+			this.#clearSubmitTimer();
+		}
+		this.#stream.pushAudio(audio);
+	};
 
 	// --- Transcription into turns --------------------------------------------
 
 	#handlePartial(text: string): void {
 		if (this.#stopped || this.#muted) return;
-		if (!this.#partial.trim() && this.#utteranceParts.length === 0) this.#userTurn += 1;
-		this.#partial = text;
+		const partial = text.trim();
+		if (partial) {
+			if (!this.#hasUtterance) {
+				this.#hasUtterance = true;
+				this.#userTurn += 1;
+			}
+			this.#awaitingFinal = true;
+			this.#clearSubmitTimer();
+		}
+		this.#partial = partial;
 		this.#emitUserTranscript(false);
 	}
 
 	#handleSegment(text: string): void {
 		if (this.#stopped || this.#muted) return;
 		const segment = text.trim();
+		this.#partial = "";
+		this.#awaitingFinal = false;
 		if (segment) {
-			if (!this.#partial.trim() && this.#utteranceParts.length === 0) this.#userTurn += 1;
+			if (!this.#hasUtterance) {
+				this.#hasUtterance = true;
+				this.#userTurn += 1;
+			}
 			this.#utteranceParts.push(segment);
 			this.#emitUserTranscript(false);
-			this.#armSubmit();
 		}
+		if (this.#utteranceParts.length > 0) this.#armSubmit();
 	}
 
 	#armSubmit(): void {
@@ -370,42 +493,80 @@ export class LocalLiveSessionController {
 	}
 
 	#submitUtterance(): void {
-		const parts = [...this.#utteranceParts];
-		if (this.#partial.trim()) parts.push(this.#partial.trim());
-		const text = parts.join(" ").trim();
-		this.#utteranceParts = [];
-		this.#partial = "";
-		this.#clearSubmitTimer();
-		this.#emitUserTranscript(true);
-		this.#emitTranscript(undefined);
-		if (!text) return;
-		if (STOP_PATTERN.test(text)) {
-			this.#vocalizer?.clear();
-			if (this.#session.isStreaming) {
-				this.#queueWork(() => this.#session.abort({ reason: "user requested stop via voice" }));
-			}
+		if (this.#partial || this.#awaitingFinal) return;
+		if (this.#inputGate.active) {
+			this.#armSubmit();
 			return;
 		}
-		this.#vocalizer?.clear();
-		this.#queueWork(async () => {
-			const started = await this.#session.prompt(text, {
-				userInitiated: true,
-				streamingBehavior: this.#session.isStreaming ? "steer" : undefined,
+		const text = this.#utteranceParts.join(" ").trim();
+		if (!text) return;
+		this.#emitUserTranscript(true);
+		this.#utteranceParts = [];
+		this.#partial = "";
+		this.#hasUtterance = false;
+		this.#clearSubmitTimer();
+		this.#emitTranscript(undefined);
+		if (this.#stopped) return;
+		const working = this.#session.isStreaming;
+		const speaking = (this.#vocalizer?.isSpeaking() ?? false) || this.#speechInterrupted;
+		const stopRequested = STOP_PATTERN.test(text);
+		if (working || speaking) {
+			this.#vocalizer?.clear();
+			this.#speechInterrupted = true;
+		}
+		if (working) {
+			// Interrupt first — Esc then typing: abort the in-flight turn, then
+			// deliver the utterance once streaming clears. A bare "stop" has no
+			// payload to re-prompt; it only cancels.
+			void this.#session.abort({ reason: "user spoke during a voice turn" }).catch(cause => {
+				if (!this.#stopped) this.#reportFailure(toError(cause));
 			});
-			if (!started) {
-				logger.warn("local live: spoken prompt was dropped", { text });
-			}
-		});
+			if (!stopRequested) this.#armInterruptedSubmit(text);
+			return;
+		}
+		if (stopRequested && speaking) return;
+		this.#promptUtterance(text);
 		this.#refreshPhase();
 	}
 
-	/** Serialize session mutations so turns never overlap a stop. */
-	#queueWork(work: () => Promise<unknown>): void {
-		this.#emitQueue = this.#emitQueue
-			.then(async () => {
-				if (!this.#stopped) await work();
+	#promptUtterance(text: string): void {
+		// Never serialize behind this promise: it may resolve only at agent_end.
+		void this.#session
+			.prompt(text, {
+				userInitiated: true,
+				streamingBehavior: "steer",
 			})
-			.catch(cause => this.#reportFailure(toError(cause)));
+			.catch(cause => {
+				if (!this.#stopped) this.#reportFailure(toError(cause));
+			});
+	}
+
+	/** Utterance captured while a turn was still unwinding: submit once
+	 * streaming clears; controller stop or a newer utterance cancels it. */
+	#interruptedUtterance: { text: string; timer?: NodeJS.Timeout } | undefined;
+
+	#armInterruptedSubmit(text: string): void {
+		this.#cancelInterruptedSubmit();
+		const entry: { text: string; timer?: NodeJS.Timeout } = { text };
+		this.#interruptedUtterance = entry;
+		const trySubmit = () => {
+			if (this.#stopped || this.#interruptedUtterance !== entry) return;
+			if (this.#session.isStreaming) {
+				entry.timer = setTimeout(trySubmit, 100);
+				entry.timer.unref?.();
+				return;
+			}
+			this.#interruptedUtterance = undefined;
+			this.#promptUtterance(entry.text);
+			this.#refreshPhase();
+		};
+		entry.timer = setTimeout(trySubmit, 100);
+		entry.timer.unref?.();
+	}
+
+	#cancelInterruptedSubmit(): void {
+		if (this.#interruptedUtterance?.timer) clearTimeout(this.#interruptedUtterance.timer);
+		this.#interruptedUtterance = undefined;
 	}
 
 	// --- Session events → speech and phase -----------------------------------
@@ -414,9 +575,10 @@ export class LocalLiveSessionController {
 		switch (event.type) {
 			case "message_start":
 				if (event.message.role === "user") this.#vocalizer?.clear();
+				if (event.message.role === "assistant") this.#speechInterrupted = false;
 				break;
 			case "message_update":
-				if (event.assistantMessageEvent.type === "text_delta") {
+				if (!this.#speechInterrupted && event.assistantMessageEvent.type === "text_delta") {
 					this.#vocalizer?.pushDelta(event.assistantMessageEvent.delta);
 				}
 				break;

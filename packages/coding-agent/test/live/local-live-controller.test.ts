@@ -2,86 +2,45 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	LocalLiveSessionController,
-	type LocalLiveDeps,
 	type LiveSpeechSink,
+	type LocalLiveDeps,
 } from "@oh-my-pi/pi-coding-agent/live/local-controller";
-import type { LiveSessionCallbacks } from "@oh-my-pi/pi-coding-agent/live/controller";
+import type { LiveTranscript } from "@oh-my-pi/pi-coding-agent/live/controller";
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { SttStreamHandle } from "@oh-my-pi/pi-coding-agent/stt/asr-client";
 
-const MERGE_MS = 40;
+const MERGE_MS = 900;
+const controllers: LocalLiveSessionController[] = [];
+const LOUD = new Float32Array(320).fill(0.2);
+const QUIET = new Float32Array(320).fill(0.003);
 
-interface FakeSession {
-	prompts: { text: string; behavior: string | undefined }[];
-	aborts: string[];
-	custom: unknown[];
-	streaming: boolean;
-	session: unknown;
-}
-
-function fakeSession(streaming = false): FakeSession {
-	const state: FakeSession = {
-		prompts: [],
-		aborts: [],
-		custom: [],
-		streaming,
-		session: undefined,
+function harness() {
+	const streams: {
+		options: Parameters<LocalLiveDeps["startStream"]>[0];
+		audio: Float32Array[];
+		cancelled: boolean;
+	}[] = [];
+	const prompts: string[] = [];
+	const transcripts: LiveTranscript[] = [];
+	const errors: Error[] = [];
+	const pendingPrompt = Promise.withResolvers<boolean>();
+	const noteReady = Promise.withResolvers<boolean>();
+	const state = {
+		streaming: false,
+		holdPrompt: false,
+		holdNote: false,
+		aborts: 0,
+		captureStopped: false,
+		captures: 0,
+		subscriptions: 0,
 	};
-	const settings = Settings.isolated({ "live.localVoice": "af_kore" });
-	state.session = {
-		settings,
-		sessionId: "test-session",
-		agent: undefined,
-		modelRegistry: {},
-		get isStreaming() {
-			return state.streaming;
-		},
-		async prompt(text: string, options?: { streamingBehavior?: string }) {
-			state.prompts.push({ text, behavior: options?.streamingBehavior });
-			return true;
-		},
-		async abort(options?: { reason?: string }) {
-			state.aborts.push(options?.reason ?? "");
-		},
-		async sendCustomMessage(message: unknown) {
-			state.custom.push(message);
-			return false;
-		},
-		subscribe() {
-			return () => {};
-		},
-	};
-	return state;
-}
-
-interface Harness {
-	controller: LocalLiveSessionController;
-	fake: FakeSession;
-	pushAudio: (samples: Float32Array) => void;
-	segment: (text: string) => void;
-	streamPushed: Float32Array[];
-	sink: LiveSpeechSink & { cleared: number; speaking: boolean };
-	phases: string[];
-}
-
-function createHarness(streaming = false): Harness {
-	const fake = fakeSession(streaming);
-	const phases: string[] = [];
-	const callbacks: LiveSessionCallbacks = {
-		onPhase: phase => phases.push(phase),
-		onLevels: () => {},
-		onTranscript: () => {},
-		onTerminal: () => {},
-	};
-	let onSegment: (text: string) => void = () => {};
-	let onAudio: (samples: Float32Array) => void = () => {};
-	const streamPushed: Float32Array[] = [];
-	const sink: Harness["sink"] = {
-		cleared: 0,
+	const sink: LiveSpeechSink & { speaking: boolean; clears: number } = {
 		speaking: false,
+		clears: 0,
 		pushDelta: () => {},
 		flush: () => {},
 		clear() {
-			this.cleared += 1;
+			this.clears++;
 			this.speaking = false;
 		},
 		isSpeaking() {
@@ -90,102 +49,250 @@ function createHarness(streaming = false): Harness {
 		setModelSource: () => {},
 		setEnhancer: () => {},
 	};
-	const stream: SttStreamHandle = {
-		pushAudio: samples => streamPushed.push(samples),
-		stop: () => Promise.resolve(""),
-		cancel: () => {},
-	};
-	const deps: LocalLiveDeps = {
-		segmentMergeMs: MERGE_MS,
-		startStream(options) {
-			onSegment = options.onSegment;
-			return stream;
+	let onAudio: (audio: Float32Array) => void = () => {};
+	const session = {
+		settings: Settings.isolated({ "live.localVoice": "af_kore" }),
+		modelRegistry: {},
+		sessionId: "test-voice",
+		get isStreaming() {
+			return state.streaming;
 		},
-		startCapture(callback) {
-			onAudio = callback;
-			return { stop: () => {} };
+		async prompt(text: string) {
+			prompts.push(text);
+			if (state.streaming) return false;
+			if (state.holdPrompt) {
+				state.streaming = true;
+				return pendingPrompt.promise;
+			}
+			return true;
 		},
-		createVocalizer: () => sink,
-	};
+		async abort() {
+			state.aborts++;
+			state.streaming = false;
+		},
+		async sendCustomMessage() {
+			if (state.holdNote) return noteReady.promise;
+			return false;
+		},
+		subscribe() {
+			state.subscriptions++;
+			return () => {
+				state.subscriptions--;
+			};
+		},
+	} as unknown as AgentSession; // Deliberate in-process fake: only the controller's session surface is exercised.
 	const controller = new LocalLiveSessionController({
-		session: fake.session as never,
-		callbacks,
+		session,
 		extractAssistantText: () => "",
-		deps,
+		callbacks: {
+			onPhase: () => {},
+			onLevels: () => {},
+			onTranscript: t => {
+				if (t) transcripts.push(t);
+			},
+			onTerminal: e => {
+				if (e) errors.push(e);
+			},
+		},
+		deps: {
+			segmentMergeMs: MERGE_MS,
+			startStream(options) {
+				const stream = { options, audio: [] as Float32Array[], detect: [] as Float32Array[], cancelled: false };
+				streams.push(stream);
+				return {
+					pushAudio: pcm => stream.audio.push(pcm.slice()),
+					pushDetect: pcm => stream.detect.push(pcm.slice()),
+					cancel: () => {
+						stream.cancelled = true;
+					},
+					stop: async () => "",
+				} satisfies SttStreamHandle;
+			},
+			startCapture(callback) {
+				state.captures++;
+				onAudio = callback;
+				return {
+					stop: () => {
+						state.captureStopped = true;
+					},
+				};
+			},
+			createVocalizer: () => sink,
+		},
 	});
+	controllers.push(controller);
 	return {
 		controller,
-		fake,
-		pushAudio: samples => onAudio(samples),
-		segment: text => onSegment(text),
-		streamPushed,
+		streams,
+		prompts,
+		transcripts,
+		errors,
+		pendingPrompt,
+		noteReady,
+		state,
 		sink,
-		phases,
+		partial: (text: string) => streams.at(-1)!.options.onPartial(text),
+		segment: (text: string) => streams.at(-1)!.options.onSegment(text),
+		audio: (samples: Float32Array) => onAudio(samples),
 	};
 }
 
-const LOUD = new Float32Array(320).fill(0.5);
-const QUIET = new Float32Array(320).fill(0.001);
-
-/** Fire the merge timer and let the queued async work land. */
-async function settle(): Promise<void> {
-	vi.advanceTimersByTime(MERGE_MS + 1);
-	for (let i = 0; i < 8; i++) await Promise.resolve();
+async function advance(ms = MERGE_MS + 1) {
+	vi.advanceTimersByTime(ms);
+	for (let n = 0; n < 8; n++) await Promise.resolve();
 }
-
 beforeEach(() => vi.useFakeTimers());
-afterEach(() => vi.useRealTimers());
+afterEach(async () => {
+	for (const controller of controllers.splice(0)) await controller.stop();
+	vi.useRealTimers();
+});
 
-describe("LocalLiveSessionController", () => {
-	it("merges segments across short pauses into one prompt", async () => {
-		const h = createHarness();
+describe("local live conversation", () => {
+	it("replaces a partial with final words once and emits one stable final transcript", async () => {
+		const h = harness();
 		await h.controller.start();
-		h.segment("first part");
-		h.segment("second part");
-		await settle();
-		expect(h.fake.prompts).toEqual([{ text: "first part second part", behavior: undefined }]);
-		await h.controller.stop();
+		h.partial("move the lamp");
+		h.partial("move the lantern");
+		h.segment("Move the lantern.");
+		await advance();
+		expect(h.prompts).toEqual(["Move the lantern."]);
+		expect(h.transcripts.filter(t => t.final)).toEqual([
+			{ role: "user", turn: 1, final: true, text: "Move the lantern." },
+		]);
+		expect(h.transcripts.every(t => t.turn === 1)).toBe(true);
+		h.segment("Now turn left.");
+		await advance();
+		expect(h.transcripts.at(-1)?.turn).toBe(2);
 	});
-
-	it("steers the running turn instead of aborting while the agent streams", async () => {
-		const h = createHarness(true);
+	it("never submits an unfinished continuation, then merges its finalized text", async () => {
+		const h = harness();
 		await h.controller.start();
-		h.segment("add this too");
-		await settle();
-		expect(h.fake.prompts[0]?.behavior).toBe("steer");
-		expect(h.fake.aborts).toEqual([]);
-		await h.controller.stop();
+		h.segment("Please move");
+		await advance(300);
+		h.partial("the green");
+		await advance(MERGE_MS * 3);
+		expect(h.prompts).toEqual([]);
+		h.segment("the green lantern.");
+		await advance();
+		expect(h.prompts).toEqual(["Please move the green lantern."]);
 	});
-
-	it("gates the mic while speech plays and barge-in clears the vocalizer", async () => {
-		const h = createHarness();
+	it("does not turn a standalone partial into a prompt", async () => {
+		const h = harness();
 		await h.controller.start();
-		h.sink.speaking = true;
-		h.pushAudio(QUIET);
-		expect(h.streamPushed.at(-1)?.every(s => s === 0)).toBe(true);
-		for (let i = 0; i < 6; i++) h.pushAudio(LOUD);
-		expect(h.sink.cleared).toBeGreaterThan(0);
-		// Buffered loud chunks flushed through after barge-in.
-		expect(h.streamPushed.at(-1)).toBe(LOUD);
-		await h.controller.stop();
+		h.partial("not finished");
+		await advance(MERGE_MS * 5);
+		expect(h.prompts).toEqual([]);
 	});
-
-	it("spoken 'stop' interrupts work without starting a new turn", async () => {
-		const h = createHarness(true);
+	it("interrupts an active turn: abort first, then the utterance becomes a fresh turn", async () => {
+		const h = harness();
+		h.state.holdPrompt = true;
+		await h.controller.start();
+		h.segment("Start the report.");
+		await advance();
+		h.segment("Include the latest figures.");
+		await advance();
+		// The second utterance aborts the in-flight turn immediately…
+		expect(h.state.aborts).toBe(1);
+		expect(h.prompts).toEqual(["Start the report."]);
+		// …and is re-submitted once streaming clears (Esc then typing).
+		h.pendingPrompt.resolve(true);
+		h.state.streaming = false;
+		await advance(200);
+		expect(h.prompts).toEqual(["Start the report.", "Include the latest figures."]);
+		expect(h.errors).toEqual([]);
+		await h.controller.stop();
+		expect(h.state.captureStopped).toBe(true);
+	});
+	it("spoken stop aborts without waiting for the active answer to resolve", async () => {
+		const h = harness();
+		h.state.holdPrompt = true;
+		await h.controller.start();
+		h.segment("Start a long task.");
+		await advance();
+		h.segment("stop");
+		await advance();
+		expect(h.state.aborts).toBe(1);
+		expect(h.prompts).toEqual(["Start a long task."]);
+		h.pendingPrompt.resolve(true);
+	});
+	it("does not silently swallow stop or thank you when idle", async () => {
+		const h = harness();
 		await h.controller.start();
 		h.segment("stop");
-		await settle();
-		expect(h.fake.aborts.length).toBe(1);
-		expect(h.fake.prompts).toEqual([]);
-		await h.controller.stop();
+		await advance();
+		h.segment("Thank you.");
+		await advance();
+		expect(h.prompts).toEqual(["stop", "Thank you."]);
 	});
-
-	it("hides the voice-mode note from the transcript but keeps it in context", async () => {
-		const h = createHarness();
+	it("mute discards stale recognizer callbacks, pre-mute words and audio", async () => {
+		const h = harness();
 		await h.controller.start();
-		const note = h.fake.custom[0] as { display: boolean; content: string };
-		expect(note.display).toBe(false);
-		expect(note.content).toContain("spoken");
+		const old = h.streams[0]!;
+		h.partial("discard this");
+		h.controller.toggleMute();
+		expect(old.cancelled).toBe(true);
+		h.audio(LOUD);
+		h.controller.toggleMute();
+		old.options.onPartial("stale preview");
+		old.options.onSegment("stale final");
+		await advance();
+		expect(h.prompts).toEqual([]);
+		h.segment("Only these words.");
+		await advance();
+		expect(h.prompts).toEqual(["Only these words."]);
+		expect(h.transcripts.some(t => t.text.includes("stale"))).toBe(false);
+	});
+	it("rejects quiet room audio and short clicks before recognition", async () => {
+		const h = harness();
+		await h.controller.start();
+		for (let n = 0; n < 100; n++) h.audio(QUIET);
+		h.audio(LOUD);
+		for (let n = 0; n < 100; n++) h.audio(QUIET);
+		expect(h.streams[0]!.audio.every(pcm => pcm.every(value => value === 0))).toBe(true);
+	});
+	it("requires 250ms of loud audio to barge in, not four small callbacks", async () => {
+		const h = harness();
+		await h.controller.start();
+		h.sink.speaking = true;
+		for (let n = 0; n < 12; n++) h.audio(LOUD);
+		expect(h.sink.clears).toBe(0);
+		h.audio(LOUD);
+		expect(h.sink.clears).toBe(1);
+		expect(h.streams[0]!.audio.some(pcm => pcm.some(value => value > 0.1))).toBe(true);
+	});
+	it("waits for detector confirmation before interrupting playback when silero resolves", async () => {
+		const h = harness();
+		await h.controller.start();
+		h.sink.speaking = true;
+		h.streams[0]!.options.onDetector?.("silero");
+		for (let n = 0; n < 13; n++) h.audio(LOUD);
+		// Loud mic alone no longer clears playback once a neural detector is live.
+		expect(h.sink.clears).toBe(0);
+		h.streams[0]!.options.onSpeech?.(true);
+		expect(h.sink.clears).toBe(1);
+		expect(h.streams[0]!.audio.some(pcm => pcm.some(value => value > 0.1))).toBe(true);
+	});
+	it("stopping during asynchronous setup cannot reopen capture or subscriptions", async () => {
+		const h = harness();
+		h.state.holdNote = true;
+		const start = h.controller.start();
+		await Promise.resolve();
 		await h.controller.stop();
+		h.noteReady.resolve(false);
+		await expect(start).rejects.toThrow("stopped");
+		expect(h.state.captures).toBe(0);
+		expect(h.state.subscriptions).toBe(0);
+		expect(h.streams).toEqual([]);
+	});
+	it("discards finalized and preview words received after call teardown", async () => {
+		const h = harness();
+		await h.controller.start();
+		const old = h.streams[0]!;
+		await h.controller.stop();
+		old.options.onPartial("late");
+		old.options.onSegment("late final");
+		await advance();
+		expect(h.prompts).toEqual([]);
+		expect(h.transcripts).toEqual([]);
 	});
 });
