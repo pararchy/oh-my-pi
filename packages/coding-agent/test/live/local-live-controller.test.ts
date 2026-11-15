@@ -220,7 +220,13 @@ describe("local live conversation", () => {
 		await h.controller.start();
 		h.segment("stop");
 		await advance();
+		// "Thank you." matches the silence-hallucination list, so it needs real
+		// admitted loudness to reach the session — Whisper's phantom version does.
+		for (let n = 0; n < 20; n++) h.audio(LOUD);
 		h.segment("Thank you.");
+		// Keep the gate's frame-counted release from closing before the merge
+		// timer fires — submit waits while the gate is active.
+		for (let n = 0; n < 40; n++) h.audio(QUIET);
 		await advance();
 		expect(h.prompts).toEqual(["stop", "Thank you."]);
 	});
@@ -249,6 +255,19 @@ describe("local live conversation", () => {
 		h.audio(LOUD);
 		for (let n = 0; n < 100; n++) h.audio(QUIET);
 		expect(h.streams[0]!.audio.every(pcm => pcm.every(value => value === 0))).toBe(true);
+	});
+	it("drops classic whisper hallucinations that arrive sub-speech, keeps real quiet speech", async () => {
+		const h = harness();
+		await h.controller.start();
+		// Quiet room audio never opens the gate; STT still emits the phantom line.
+		for (let n = 0; n < 20; n++) h.audio(QUIET);
+		h.segment("Thank you for watching!");
+		await advance();
+		expect(h.prompts).toEqual([]);
+		// Quiet but genuinely requested content still delivers.
+		h.segment("Add the lamp to the scene.");
+		await advance();
+		expect(h.prompts).toEqual(["Add the lamp to the scene."]);
 	});
 	it("requires 250ms of loud audio to barge in, not four small callbacks", async () => {
 		const h = harness();

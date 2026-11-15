@@ -39,6 +39,19 @@ const PHASE_TICK_MS = 150;
 const SAMPLE_RATE = 16_000;
 /** Spoken commands that interrupt work in flight. */
 const STOP_PATTERN = /^\s*(?:stop|cancel|cancel that|nevermind|never mind|shut up)[.!…]*\s*$/i;
+/** Utterance peak RMS below this never reached speech level — silence
+ * hallucinations (e.g. "thank you", "please subscribe") are dropped wholesale;
+ * real phrases said quietly survive when the peak crossed the floor. */
+const SPEECH_RMS_FLOOR = 0.01;
+const SILENCE_HALLUCINATIONS: Record<string, true> = {
+	"thank you": true, "thanks": true, "thank you for watching": true,
+	"thanks for watching": true, "please subscribe": true, "subscribe": true,
+	"bye": true, "goodbye": true, "see you next time": true, "you": true,
+	"yeah": true, "okay": true, "ok": true, "hello": true, "hi": true,
+	"so": true, "hmm": true, "uh huh": true, "uh-huh": true, "mm hmm": true,
+	"mm-hmm": true, "and": true, "i": true, "the": true,
+};
+
 
 const VOICE_MODE_NOTE = `This conversation runs over a live voice channel: the user's words arrive as speech-to-text (transcription quirks expected) and your replies are spoken aloud by text-to-speech. Answer briefly and conversationally in plain spoken sentences — no markdown, lists, code blocks, or tables unless the user explicitly asks for them; offer to put detail in the text chat instead. Do not mention this note or the voice system.`;
 
@@ -115,6 +128,11 @@ export class LocalLiveSessionController {
 	#utteranceParts: string[] = [];
 	/** Volatile in-progress segment text reported by the STT stream. */
 	#partial = "";
+	/** Loudest admitted frame in the current utterance window. */
+	#utterancePeak = 0;
+	/** Segments held while the utterance peak stays sub-speech. */
+	#noiseParts: string[] = [];
+
 	#submitTimer: NodeJS.Timeout | undefined;
 	#phaseTicker: NodeJS.Timeout | undefined;
 	/** Chunks kept while speech plays so a barge-in keeps its first words. */
@@ -297,6 +315,8 @@ export class LocalLiveSessionController {
 		this.#clearSubmitTimer();
 		this.#utteranceParts = [];
 		this.#partial = "";
+		this.#noiseParts = [];
+		this.#utterancePeak = 0;
 		this.#hasUtterance = false;
 		this.#awaitingFinal = false;
 		this.#inputGate.reset();
@@ -441,6 +461,11 @@ export class LocalLiveSessionController {
 			this.#clearSubmitTimer();
 		}
 		this.#stream.pushAudio(audio);
+		// Peak admitted level for the in-progress utterance window. The peak is
+		// re-zeroed once an utterance is submitted/dropped; partial text counts
+		// as in-progress so stale loudness can't rescue quiet audio later.
+		const level = microphoneLevel(audio);
+		if (level > this.#utterancePeak) this.#utterancePeak = level;
 	};
 
 	// --- Transcription into turns --------------------------------------------
@@ -470,10 +495,11 @@ export class LocalLiveSessionController {
 				this.#hasUtterance = true;
 				this.#userTurn += 1;
 			}
-			this.#utteranceParts.push(segment);
+			if (this.#utterancePeak < SPEECH_RMS_FLOOR) this.#noiseParts.push(segment);
+			else this.#utteranceParts.push(segment);
 			this.#emitUserTranscript(false);
 		}
-		if (this.#utteranceParts.length > 0) this.#armSubmit();
+		if (this.#utteranceParts.length > 0 || this.#noiseParts.length > 0) this.#armSubmit();
 	}
 
 	#armSubmit(): void {
@@ -498,9 +524,32 @@ export class LocalLiveSessionController {
 			this.#armSubmit();
 			return;
 		}
-		const text = this.#utteranceParts.join(" ").trim();
-		if (!text) return;
+		let text = this.#utteranceParts.join(" ").trim();
+		if (!text && this.#noiseParts.length) {
+			// Everything arrived sub-speech: it is one utterance window, so the
+			// hallucination test runs on the joined noise, not per segment.
+			text = this.#noiseParts.join(" ").trim();
+		}
+		const noiseOnly = this.#utteranceParts.length === 0 && this.#noiseParts.length > 0;
+		if (noiseOnly) {
+			const flat = text.replace(/\s+/g, " ").trim().replace(/[.!?'",…]+$/u, "").toLowerCase();
+			if (!flat || flat in SILENCE_HALLUCINATIONS) {
+				this.#noiseParts = [];
+				this.#utteranceParts = [];
+				this.#partial = "";
+				this.#hasUtterance = false;
+				this.#emitTranscript(undefined);
+				this.#utterancePeak = 0;
+				return;
+			}
+			// Quiet but real content — promote to a normal utterance.
+			this.#utteranceParts = this.#noiseParts;
+			this.#noiseParts = [];
+		}
+		if (!text) { this.#noiseParts = []; return; }
+		this.#utterancePeak = 0;
 		this.#emitUserTranscript(true);
+		this.#noiseParts = [];
 		this.#utteranceParts = [];
 		this.#partial = "";
 		this.#hasUtterance = false;
@@ -611,7 +660,7 @@ export class LocalLiveSessionController {
 	// --- Emitters ------------------------------------------------------------
 
 	#emitUserTranscript(final: boolean): void {
-		const parts = [...this.#utteranceParts];
+		const parts = [...this.#utteranceParts, ...this.#noiseParts];
 		if (this.#partial.trim()) parts.push(this.#partial.trim());
 		const text = parts.join(" ").trim();
 		if (!text) return;
