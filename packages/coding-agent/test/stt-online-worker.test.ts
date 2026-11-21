@@ -69,6 +69,56 @@ class OnlineRecognizer implements runtime.SherpaOnlineRecognizer {
 	}
 }
 
+// Deterministic detector double: a 7 sample opens speech (queueing a finalized
+// run), a -7 sample closes it; `flush` ends any open run like the native API.
+class FakeVad implements runtime.SherpaVad {
+	static instances: FakeVad[] = [];
+	fed: Float32Array[] = [];
+	detected = false;
+	#empty = true;
+
+	constructor() {
+		FakeVad.instances.push(this);
+	}
+
+	acceptWaveform(samples: Float32Array): void {
+		this.fed.push(samples);
+		for (const sample of samples) {
+			if (sample === 7) {
+				this.detected = true;
+				this.#empty = false;
+			} else if (sample === -7) {
+				this.detected = false;
+			}
+		}
+	}
+
+	isDetected(): boolean {
+		return this.detected;
+	}
+
+	isEmpty(): boolean {
+		return this.#empty;
+	}
+
+	front(): { samples: Float32Array } {
+		return { samples: new Float32Array(0) };
+	}
+
+	pop(): void {
+		this.#empty = true;
+	}
+
+	flush(): void {
+		this.detected = false;
+	}
+
+	clear(): void {
+		this.detected = false;
+		this.#empty = true;
+	}
+}
+
 class OfflineStream {
 	samples: Float32Array = new Float32Array();
 	acceptWaveform({ samples }: { samples: Float32Array; sampleRate: number }): void {
@@ -85,6 +135,7 @@ const offlineRecognizer = {
 const nativeRuntime: runtime.SherpaRuntime = {
 	OnlineRecognizer,
 	OfflineRecognizer: { createAsync: async () => offlineRecognizer },
+	Vad: FakeVad,
 };
 const onlineSpec = registry.getSttModelSpec("nemotron-streaming-en-0.6b")!;
 const offlineSpec = registry.getSttModelSpec("parakeet-tdt-0.6b-v3")!;
@@ -152,6 +203,7 @@ beforeEach(() => {
 	spyOn(fs, "mkdir").mockResolvedValue(undefined);
 	spyOn(fs, "stat").mockResolvedValue(presentFile);
 	OnlineRecognizer.instances.length = 0;
+	FakeVad.instances.length = 0;
 });
 
 afterEach(() => mock.restore());
@@ -365,5 +417,111 @@ describe("online stream terminal boundaries", () => {
 		await nextTurn();
 		expect(h.events).toEqual([]);
 		expect(OnlineRecognizer.instances[0]!.streams).toHaveLength(0);
+	});
+});
+describe("neural speech detection", () => {
+	it("emits detector and speech-state edges for silero sessions", async () => {
+		const h = harness();
+		h.send({ type: "stream_start", id: "vad", modelKey: key, speechDetection: "silero" });
+		expect(await h.waitFor("detector", "vad")).toEqual({ type: "detector", id: "vad", detector: "silero" });
+		const vad = FakeVad.instances[0]!;
+		h.send({ type: "stream_audio", id: "vad", audio: Float32Array.of(7) });
+		expect(await h.waitFor("speech_activity", "vad")).toEqual({
+			type: "speech_activity",
+			id: "vad",
+			active: true,
+		});
+		h.send({ type: "stream_detect", id: "vad", audio: Float32Array.of(-7) });
+		await nextTurn();
+		await nextTurn();
+		expect(h.events.filter(event => event.type === "speech_activity")).toEqual([
+			{ type: "speech_activity", id: "vad", active: true },
+			{ type: "speech_activity", id: "vad", active: false },
+		]);
+		expect(vad.fed.map(chunk => chunk[0])).toEqual([7, -7]);
+		h.send({ type: "stream_stop", id: "vad" });
+		await h.waitFor("stream_done", "vad");
+	});
+
+	it("keeps detect-only audio out of the recognizer", async () => {
+		const h = harness();
+		h.send({ type: "stream_start", id: "detect-only", modelKey: key, speechDetection: "silero" });
+		await h.waitFor("detector", "detect-only");
+		h.send({ type: "stream_detect", id: "detect-only", audio: Float32Array.of(1) });
+		await nextTurn();
+		expect(transcriptEvents(h.events)).toEqual([]);
+		expect(OnlineRecognizer.instances[0]!.streams[0]?.pending ?? []).toEqual([]);
+		expect(FakeVad.instances[0]!.fed[0]![0]).toBe(1);
+		h.send({ type: "stream_audio", id: "detect-only", audio: Float32Array.of(1) });
+		expect(await h.waitFor("partial", "detect-only")).toEqual({
+			type: "partial",
+			id: "detect-only",
+			text: "hello",
+		});
+		h.send({ type: "stream_stop", id: "detect-only" });
+		await h.waitFor("stream_done", "detect-only");
+	});
+
+	it("reports energy fallback and still transcribes when the detector fails", async () => {
+		spyOn(runtime, "loadSherpaRuntime").mockRejectedValueOnce(new Error("vad runtime missing"));
+		const h = harness();
+		h.send({ type: "stream_start", id: "no-vad", modelKey: key, speechDetection: "silero" });
+		expect(await h.waitFor("detector", "no-vad")).toEqual({ type: "detector", id: "no-vad", detector: "energy" });
+		h.send({ type: "stream_audio", id: "no-vad", audio: Float32Array.of(1) });
+		expect(await h.waitFor("partial", "no-vad")).toEqual({ type: "partial", id: "no-vad", text: "hello" });
+		expect(h.events.filter(event => event.type === "speech_activity")).toEqual([]);
+		h.send({ type: "stream_stop", id: "no-vad" });
+		expect(await h.waitFor("stream_done", "no-vad")).toEqual({
+			type: "stream_done",
+			id: "no-vad",
+			text: "hello",
+		});
+	});
+
+	it("closes speech activity on stop and cancel", async () => {
+		const h = harness();
+		h.send({ type: "stream_start", id: "vad-stop", modelKey: key, speechDetection: "silero" });
+		await h.waitFor("detector", "vad-stop");
+		h.send({ type: "stream_audio", id: "vad-stop", audio: Float32Array.of(7) });
+		await h.waitFor("speech_activity", "vad-stop");
+		h.send({ type: "stream_stop", id: "vad-stop" });
+		await h.waitFor("stream_done", "vad-stop");
+		expect(h.events.filter(event => event.type === "speech_activity")).toEqual([
+			{ type: "speech_activity", id: "vad-stop", active: true },
+			{ type: "speech_activity", id: "vad-stop", active: false },
+		]);
+
+		h.send({ type: "stream_start", id: "vad-cancel", modelKey: key, speechDetection: "silero" });
+		await h.waitFor("detector", "vad-cancel");
+		h.send({ type: "stream_audio", id: "vad-cancel", audio: Float32Array.of(7) });
+		await h.waitFor("speech_activity", "vad-cancel");
+		h.send({ type: "stream_cancel", id: "vad-cancel" });
+		expect(h.events.filter(event => event.type === "speech_activity" && event.id === "vad-cancel")).toEqual([
+			{ type: "speech_activity", id: "vad-cancel", active: true },
+			{ type: "speech_activity", id: "vad-cancel", active: false },
+		]);
+	});
+
+	it("answers vad_prepare for warming the detector cache", async () => {
+		const h = harness();
+		h.send({ type: "vad_prepare", id: "warm", modelKey: key });
+		expect(await h.waitFor("vad_ready", "warm")).toEqual({ type: "vad_ready", id: "warm" });
+		expect(FakeVad.instances).toHaveLength(1);
+	});
+
+	it("emits the closing speech edge before stream_done so the client still sees it", async () => {
+		const h = harness();
+		h.send({ type: "stream_start", id: "edge-order", modelKey: key, speechDetection: "silero" });
+		await h.waitFor("detector", "edge-order");
+		h.send({ type: "stream_audio", id: "edge-order", audio: Float32Array.of(7) });
+		await h.waitFor("speech_activity", "edge-order");
+		h.send({ type: "stream_stop", id: "edge-order" });
+		await h.waitFor("stream_done", "edge-order");
+		const tail = h.events.filter(event => event.type === "speech_activity" || event.type === "stream_done");
+		expect(tail).toEqual([
+			{ type: "speech_activity", id: "edge-order", active: true },
+			{ type: "speech_activity", id: "edge-order", active: false },
+			{ type: "stream_done", id: "edge-order", text: expect.any(String) },
+		]);
 	});
 });

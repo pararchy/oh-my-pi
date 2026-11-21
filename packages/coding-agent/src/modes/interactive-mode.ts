@@ -130,6 +130,7 @@ import type { GoalModeState } from "../goals/state";
 import { rescopeSessionToCwd } from "../session/cwd-rescope";
 import { copyLocalArtifacts, resolveLocalRoot } from "../internal-urls";
 import { hasNativeJudge } from "../judgment";
+import type { LiveEngine } from "../live/settings";
 import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "../lsp/startup-events";
 import type { MCPManager } from "../mcp";
 import {
@@ -2611,7 +2612,27 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (requestRender) this.ui.requestRender();
 	}
 
+	#syncMcpHeader(): void {
+		if (!this.composer.fullscreen) return;
+		const manager = this.mcpManager;
+		const names = manager?.getAllServerNames() ?? [];
+		const parts = manager
+			? names.map(name => {
+					const cleanName = replaceTabs(sanitizeText(name)).replace(/[\r\n]+/g, " ");
+					const state = manager.getConnectionStatus(name);
+					const tools = manager.getConnection(name)?.tools;
+					return `${cleanName}: ${state}${state === "connected" && tools ? ` (${tools.length} listed)` : ""}`;
+				})
+			: [];
+		this.statusLine.setHookStatus(
+			"mcp",
+			names.length ? `MCP ${names.length} servers · ${parts.join(" · ")}` : "MCP none loaded",
+		);
+		this.ui.requestRender();
+	}
+
 	#handleMcpConnectionStatusEvent(event: McpConnectionStatusEvent): void {
+		this.#syncMcpHeader();
 		if (cfgStartupQuiet.get(this.settings)) return;
 		if (event.type === "connecting") {
 			this.#mcpStatusOrder = [];
@@ -2767,9 +2788,17 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#syncHeaderExtras();
 		this.statusLine.watchBranch(() => this.ui.requestRender());
 		this.composer.setStatusComponent(this.statusLine);
+		this.#syncMcpHeader();
+		if (this.composer.fullscreen && this.mcpManager) {
+			this.#eventBusUnsubscribers.push(
+				this.mcpManager.addConnectionStatusListener(() => this.#syncMcpHeader()),
+				this.mcpManager.addCatalogChangeListener(() => this.#syncMcpHeader()),
+			);
+		}
 
 		this.composer.setRuntimeChildren(
 			[
+				...(this.composer.fullscreen ? [this.hookWidgetContainerAbove] : []),
 				this.chatContainer,
 				this.pendingShellContainer,
 				this.pendingMessagesContainer,
@@ -2795,11 +2824,14 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.statusContainer,
 				this.attachmentChipsContainer,
 				this.editorTopGapContainer,
-				this.hookWidgetContainerAbove,
+				...(!this.composer.fullscreen ? [this.hookWidgetContainerAbove] : []),
 				this.editorContainer,
 				this.hookWidgetContainerBelow,
 			],
 			{
+
+				fixedHeader: this.hookWidgetContainerAbove,
+
 				// Natively the HUD pills lead the dock, aboveEditor hook widgets sit
 				// over the working row (the tray's header, so nothing comes between
 				// the two), queued messages sit between the working row and the
@@ -4660,7 +4692,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		const shape = cfgComposerShape.get(settings);
 		const style = getComposerStyle(shape);
 		this.composer.setPreferences({ composerShape: shape });
-		this.statusLine.attachToEditor(this.editor, style);
+		this.statusLine.attachToEditor(
+			this.editor,
+			this.composer.fullscreen ? { statusAttachment: "none", bottomBar: "none", bottomBarGap: false } : style,
+		);
 		this.updateEditorBorderColor();
 		this.#scheduleComposerStatusPersist();
 		this.ui.requestRender();
@@ -9731,14 +9766,14 @@ export class InteractiveMode implements InteractiveModeContext {
 		return undefined;
 	}
 
-	/** Start or stop the Codex-backed realtime voice surface. */
-	async handleLiveCommand(): Promise<void> {
+	/** Start or stop the realtime voice surface; `engine` overrides `live.engine` for this call. */
+	async handleLiveCommand(engine?: LiveEngine): Promise<void> {
 		const blocker = this.#liveStartBlocker();
 		if (blocker) {
 			this.showWarning(blocker);
 			return;
 		}
-		await this.#liveCommandController.handleCommand();
+		await this.#liveCommandController.handleCommand(engine);
 	}
 
 	/** Start a live session whose audio runs on an extension's own WebRTC peer. */

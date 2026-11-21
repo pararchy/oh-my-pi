@@ -1,12 +1,19 @@
 import { type ModelWorkerMessage, ModelWorkerHost } from "../subprocess/model-worker-host";
 import { SMOKE_TEST_TIMEOUT_MS } from "../subprocess/worker-client";
-import type { SttProgressEvent, SttWorkerInbound, SttWorkerOutbound } from "./asr-protocol";
+import type { SpeechDetection, SttProgressEvent, SttWorkerInbound, SttWorkerOutbound } from "./asr-protocol";
 import { getSttModelSpec, type SttModelKey } from "./models";
 
 type TranscribeRequest = {
 	kind: "transcribe";
 	modelKey: SttModelKey;
 	resolve: (text: string) => void;
+	reject: (error: Error) => void;
+};
+
+type VadRequest = {
+	kind: "vad";
+	modelKey: SttModelKey;
+	resolve: () => void;
 	reject: (error: Error) => void;
 };
 
@@ -29,6 +36,8 @@ export interface SttDownloadResult {
 export interface SttStreamHandle {
 	/** Feed 16 kHz mono float samples as the recorder produces them. */
 	pushAudio(audio: Float32Array): void;
+	/** Feed audio to the speech detector only (never reaches the recognizer). */
+	pushDetect(audio: Float32Array): void;
 	/** Flush the trailing segment and resolve with the full joined transcript. */
 	stop(): Promise<string>;
 	/** Tear the session down without a final flush (resolves `stop()` with ""). */
@@ -38,6 +47,12 @@ export interface SttStreamHandle {
 export interface SttStreamOptions {
 	language?: string;
 	signal?: AbortSignal;
+	/** Local voice uses Silero; dictation callers retain their existing energy detector. */
+	speechDetection?: SpeechDetection;
+	onSpeech?: (active: boolean) => void;
+	/** Resolved speech detector; `"energy"` when the neural path fell back. */
+	onDetector?: (detector: SpeechDetection) => void;
+	onError?: (error: Error) => void;
 	/** Volatile transcript of the in-progress segment, refreshed as audio arrives. */
 	onPartial?: (text: string) => void;
 	/** A finalized segment, emitted once when the endpointer commits it. */
@@ -48,6 +63,9 @@ interface StreamState {
 	modelKey: SttModelKey;
 	onPartial: ((text: string) => void) | undefined;
 	onSegment: ((text: string, index: number) => void) | undefined;
+	onSpeech: SttStreamOptions["onSpeech"];
+	onDetector: SttStreamOptions["onDetector"];
+	onError: SttStreamOptions["onError"];
 	resolve: (text: string) => void;
 	reject: (error: Error) => void;
 	/** Run `apply` (resolve/reject) once, then unregister the stream. */
@@ -62,7 +80,13 @@ export const STT_WORKER_ARG = "__omp_worker_stt";
 
 export class SttClient {
 	#streams = new Map<string, StreamState>();
-	#host: ModelWorkerHost<SttModelKey, SttWorkerInbound, SttWorkerOutbound, TranscribeRequest, SttProgressEvent>;
+	#host: ModelWorkerHost<
+		SttModelKey,
+		SttWorkerInbound,
+		SttWorkerOutbound,
+		TranscribeRequest | VadRequest,
+		SttProgressEvent
+	>;
 
 	/** `smoke`: a private unit the daemon stops once {@link terminate} releases it. */
 	constructor(options: { smoke?: boolean } = {}) {
@@ -80,6 +104,16 @@ export class SttClient {
 
 	onProgress(listener: (event: SttProgressEvent) => void): () => void {
 		return this.#host.onProgress(listener);
+	}
+
+	/** Warm the pinned neural detector before opening a live microphone. */
+	prepareVad(modelKey: SttModelKey, options: { signal?: AbortSignal } = {}): Promise<void> {
+		return this.#host.request<void>(
+			options.signal,
+			id => ({ type: "vad_prepare", id, modelKey }),
+			(resolve, reject) => ({ kind: "vad", modelKey, resolve, reject }),
+			(_resolve, reject) => reject(new DOMException("The operation was aborted.", "AbortError")),
+		);
 	}
 
 	/**
@@ -128,14 +162,26 @@ export class SttClient {
 			modelKey,
 			onPartial: options.onPartial,
 			onSegment: options.onSegment,
+			onSpeech: options.onSpeech,
+			onError: options.onError,
+			onDetector: options.onDetector,
 			resolve,
 			reject,
 			finish,
 		});
-		worker.send({ type: "stream_start", id, modelKey, language: options.language });
+		worker.send({
+			type: "stream_start",
+			id,
+			modelKey,
+			language: options.language,
+			speechDetection: options.speechDetection,
+		});
 		const handle: SttStreamHandle = {
 			pushAudio: audio => {
 				if (!settled) worker.send({ type: "stream_audio", id, audio });
+			},
+			pushDetect: audio => {
+				if (!settled) worker.send({ type: "stream_detect", id, audio });
 			},
 			stop: () => {
 				if (!settled) worker.send({ type: "stream_stop", id });
@@ -166,11 +212,19 @@ export class SttClient {
 	}
 
 	#handleMessage(message: ModelWorkerMessage<SttWorkerOutbound>): void {
-		if (message.type === "partial" || message.type === "segment" || message.type === "stream_done") {
+		if (
+			message.type === "partial" ||
+			message.type === "segment" ||
+			message.type === "stream_done" ||
+			message.type === "speech_activity" ||
+			message.type === "detector"
+		) {
 			const stream = this.#streams.get(message.id);
 			if (!stream) return;
 			if (message.type === "partial") stream.onPartial?.(message.text);
 			else if (message.type === "segment") stream.onSegment?.(message.text, message.index);
+			else if (message.type === "speech_activity") stream.onSpeech?.(message.active);
+			else if (message.type === "detector") stream.onDetector?.(message.detector);
 			else stream.finish(() => stream.resolve(message.text));
 			return;
 		}
@@ -181,7 +235,9 @@ export class SttClient {
 				const stream = this.#streams.get(message.id);
 				if (stream) {
 					this.#host.emitProgress({ modelKey: stream.modelKey, status: "error" }, message.error);
-					stream.finish(() => stream.reject(new Error(message.error)));
+					const error = new Error(message.error);
+					stream.finish(() => stream.reject(error));
+					stream.onError?.(error);
 				}
 			}
 			return;
@@ -191,13 +247,17 @@ export class SttClient {
 			if (pending.kind === "transcribe") pending.resolve(message.text);
 			return;
 		}
+		if (message.type === "vad_ready") {
+			if (pending.kind === "vad") pending.resolve();
+			return;
+		}
 		// message.type === "error"
 		if (pending.kind === "ping") {
 			pending.reject(new Error(message.error));
 			return;
 		}
 		this.#host.emitProgress({ modelKey: pending.modelKey, status: "error" }, message.error);
-		if (pending.kind === "transcribe") pending.reject(new Error(message.error));
+		if (pending.kind === "transcribe" || pending.kind === "vad") pending.reject(new Error(message.error));
 		else pending.resolve({ ok: false, error: message.error });
 	}
 
@@ -205,6 +265,7 @@ export class SttClient {
 		for (const stream of Array.from(this.#streams.values())) {
 			this.#host.emitProgress({ modelKey: stream.modelKey, status: "error" }, error.message);
 			stream.finish(() => stream.reject(error));
+			stream.onError?.(error);
 		}
 	}
 }

@@ -108,6 +108,7 @@ describe("STTController preflight", () => {
 		settings.setModelRole("dictation", "local/whisper-base");
 		vi.spyOn(asrClient.sttClient, "startStream").mockReturnValue({
 			pushAudio: vi.fn(),
+			pushDetect: vi.fn(),
 			stop: vi.fn().mockResolvedValue(""),
 			cancel: vi.fn(),
 		});

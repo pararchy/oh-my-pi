@@ -257,8 +257,8 @@ describe("LiveSessionController with a caller-owned peer", () => {
 		const delegated: string[] = [];
 		const phases: string[] = [];
 		const agentSession = {
-			modelRegistry: { authStorage: {} },
 			settings: Settings.isolated(),
+			modelRegistry: { authStorage: {} },
 			sessionId: "s1",
 			subscribe: () => () => {},
 			sendCustomMessage: async (message: { content: string }) => {
@@ -296,4 +296,46 @@ describe("LiveSessionController with a caller-owned peer", () => {
 		expect(phases.at(-1)).toBe("working");
 		await session.stop();
 	});
+
+	it.each([undefined, "Address {{username}} and delegate tool work."])(
+		"appends literal persona instructions without replacing the base prompt (%s)",
+		async instructions => {
+			const sent: string[] = [];
+			const transportSpy = vi.spyOn(liveTransport, "LiveTransport") as unknown as {
+				mockImplementation(implementation: (options: LiveTransportOptions) => object): void;
+			};
+			transportSpy.mockImplementation(function (options: LiveTransportOptions) {
+				sent.push(options.instructions);
+				return { connect: async () => {}, close: async () => {}, send: async () => {} };
+			});
+			const personality = 'Speak as Gretel. Literal template example: {{username}}. Quote: "scope".';
+			for (const value of ["", " \n ", personality]) {
+				const session = new LiveSessionController({
+					session: {
+						settings: Settings.isolated({ "live.personality": value }),
+						modelRegistry: { authStorage: {} },
+						sessionId: "personality-test",
+						subscribe: () => () => {},
+					} as unknown as LiveSessionControllerOptions["session"],
+					instructions,
+					extractAssistantText: () => "",
+					sdpOffer: "v=0 offer",
+					callbacks: {
+						onPhase: () => {},
+						onLevels: () => {},
+						onTranscript: () => {},
+						onTerminal: () => {},
+					},
+				});
+				try {
+					await session.start();
+				} finally {
+					await session.stop();
+				}
+			}
+			expect(sent[0]).not.toContain("{{username}}");
+			expect(sent[1]).toBe(sent[0]);
+			expect(sent[2]).toBe(`${sent[0]}\n\n${personality}`);
+		},
+	);
 });

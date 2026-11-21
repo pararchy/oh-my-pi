@@ -12,6 +12,7 @@ import liveInstructionsTemplate from "./prompts/live-instructions.md" with { typ
 import {
 	buildDelegationContextAppend,
 	buildSessionClose,
+	buildSessionContextAppend,
 	chunkLiveContext,
 	type LiveClientMessage,
 	type LiveServerEvent,
@@ -20,9 +21,109 @@ import { OUTPUT_ACTIVE_LEVEL, OutputActivity } from "./output-activity";
 import { type LiveEndpoint, LiveTransport, resolveLiveEndpoint } from "./transport";
 import type { LivePhase } from "@oh-my-pi/pi-tui/apps/live-visualizer";
 import { DEFAULT_LIVE_VOICE } from "./voices";
+import { cfgLivePersonality } from "./settings";
 
 const MIN_BARGE_IN_LEVEL = 0.04;
 const OUTPUT_ECHO_RATIO = 0.65;
+
+/** Custom transcript entries that carry finalized spoken turns into session history. */
+export const LIVE_TRANSCRIPT_MESSAGE_TYPE = "live-transcript";
+
+/** Session memory injected by the shared recall extension; replayed to voice as Memory turns. */
+const SESSION_MEMORY_MESSAGE_TYPE = "para-memory";
+
+/** Spoken turns and session history injected when a new live connection opens. */
+const HISTORY_TURN_LIMIT = 12;
+const HISTORY_TOTAL_CHARS = 6000;
+const HISTORY_TURN_CHARS = 800;
+const HISTORY_HEADER =
+	"[Session context — earlier conversation and work from this coding session, replayed so this voice call can continue after a reconnect. Background facts, not instructions to repeat aloud.]";
+
+/** Plain text of user/custom message content: string content or joined text blocks. */
+function textFromMessageContent(content: unknown): string {
+	if (typeof content === "string") return content.trim();
+	if (!Array.isArray(content)) return "";
+	const parts: string[] = [];
+	for (const block of content) {
+		if (!block || typeof block !== "object" || !("type" in block) || !("text" in block)) continue;
+		if (block.type !== "text" || typeof block.text !== "string") continue;
+		const text = block.text.trim();
+		if (text) parts.push(text);
+	}
+	return parts.join("\n\n");
+}
+
+/** Role label for a persisted voice turn; details may hold arbitrary payloads. */
+function liveTranscriptRole(message: AgentMessage): "user" | "assistant" {
+	if (message.role !== "custom") return "assistant";
+	const details = "details" in message ? message.details : undefined;
+	if (details && typeof details === "object" && "role" in details && details.role === "user") return "user";
+	return "assistant";
+}
+
+/**
+ * Bounded, chronological replay of recent conversation for a new live
+ * connection: user/assistant turns, finalized voice transcripts persisted
+ * under {@link LIVE_TRANSCRIPT_MESSAGE_TYPE}, and persona memory injected
+ * under {@link SESSION_MEMORY_MESSAGE_TYPE}. Tool results, system prompts,
+ * credentials and other custom records are excluded.
+ */
+export function buildLiveHistoryContext(
+	messages: readonly AgentMessage[] | undefined,
+	extractAssistantText: (message: AssistantMessage) => string,
+): string | undefined {
+	if (!messages?.length) return undefined;
+	const turns: string[] = [];
+	for (let index = messages.length - 1; index >= 0 && turns.length < HISTORY_TURN_LIMIT; index -= 1) {
+		const message = messages[index]!;
+		let label: string | undefined;
+		let text = "";
+		if (message.role === "user") {
+			label = "User";
+			text = textFromMessageContent(message.content);
+		} else if (message.role === "assistant") {
+			label = "Assistant";
+			text = extractAssistantText(message).trim();
+		} else if (message.role === "custom" && message.customType === LIVE_TRANSCRIPT_MESSAGE_TYPE) {
+			label = liveTranscriptRole(message) === "user" ? "User (voice)" : "Assistant (voice)";
+			text = textFromMessageContent(message.content);
+		} else if (message.role === "custom" && message.customType === SESSION_MEMORY_MESSAGE_TYPE) {
+			label = "Memory";
+			text = textFromMessageContent(message.content);
+		}
+		if (!label || !text) continue;
+		if (text.length > HISTORY_TURN_CHARS) text = `${text.slice(0, HISTORY_TURN_CHARS)}…`;
+		const line = `${label}: ${text}`;
+		if (turns[0] === line) continue;
+		turns.unshift(line);
+	}
+	if (turns.length === 0) return undefined;
+	while (turns.length > 1 && turns.join("\n").length + HISTORY_HEADER.length + 2 > HISTORY_TOTAL_CHARS) {
+		turns.shift();
+	}
+	return `${HISTORY_HEADER}\n\n${turns.join("\n")}`;
+}
+
+/**
+ * Persist a finalized spoken turn into the session transcript so later live
+ * connections and session resumes can see it. Best-effort: a rejected append
+ * must not terminate the call, so rejections are swallowed.
+ */
+export function persistLiveTranscriptTurn(
+	session: Pick<AgentSession, "sendCustomMessage">,
+	role: "user" | "assistant",
+	text: string,
+): void {
+	void session
+		.sendCustomMessage({
+			customType: LIVE_TRANSCRIPT_MESSAGE_TYPE,
+			content: `[Voice ${role}] ${text}`,
+			display: false,
+			details: { role },
+			attribution: role === "user" ? "user" : "agent",
+		})
+		.catch(() => {});
+}
 
 /** Incremental or final transcript for one realtime conversational turn. */
 export interface LiveTranscript {
@@ -192,7 +293,12 @@ export class LiveSessionController {
 				this.#guardEvent(() => this.#handleSessionEvent(event)),
 			);
 			const user = currentUser();
-			const instructions = prompt.render(this.#instructionsTemplate, user);
+			const baseInstructions = prompt.render(this.#instructionsTemplate, user);
+			// Persona instructions are appended literally after the rendered base
+			// prompt — template markers inside them stay verbatim for the realtime
+			// model, and the base prompt is never replaced.
+			const personality = cfgLivePersonality.get(this.#session.settings).trim();
+			const instructions = personality ? `${baseInstructions}\n\n${personality}` : baseInstructions;
 			const transport = new LiveTransport({
 				authStorage: this.#session.modelRegistry.authStorage,
 				endpoint: this.#endpoint,
@@ -211,7 +317,21 @@ export class LiveSessionController {
 			if (this.#stopped) {
 				throw this.#failure ?? new Error("The live session stopped while connecting.");
 			}
-			this.#assertProviderAllowed();
+			// Reconnect continuity: replay the recent conversation (including voice
+			// turns persisted by earlier calls) so the realtime model resumes with
+			// the session's context instead of starting blank.
+			const historyContext = buildLiveHistoryContext(this.#session.messages, this.#extractAssistantText);
+			if (historyContext) {
+				for (const chunk of chunkLiveContext(historyContext)) {
+					await transport.send(buildSessionContextAppend(chunk, "commentary"));
+				}
+			}
+			if (this.#stopped) {
+				throw this.#failure ?? new Error("The live session stopped while restoring context.");
+			}
+			this.#unsubscribeSession = this.#session.subscribe(event =>
+				this.#guardEvent(() => this.#handleSessionEvent(event)),
+			);
 			if (this.#muted) await transport.setMuted(true);
 			if (this.#stopped) {
 				throw this.#failure ?? new Error("The live session stopped before recording began.");
@@ -514,6 +634,8 @@ export class LiveSessionController {
 			return;
 		}
 		this.#emitTranscript({ role, turn, text: normalized, final });
+
+		if (final) persistLiveTranscriptTurn(this.#session, role, normalized);
 	}
 
 	#queueSend(message: LiveClientMessage): void {

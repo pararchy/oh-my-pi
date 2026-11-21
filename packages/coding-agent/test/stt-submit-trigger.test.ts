@@ -202,6 +202,7 @@ describe("STTController submit trigger integration", () => {
 		cfgSttSubmitTrigger.set(settings, trigger);
 		vi.spyOn(asrClient.sttClient, "startStream").mockReturnValue({
 			pushAudio: vi.fn(),
+			pushDetect: vi.fn(),
 			stop: vi.fn().mockResolvedValue(transcript),
 			cancel: vi.fn(),
 		});

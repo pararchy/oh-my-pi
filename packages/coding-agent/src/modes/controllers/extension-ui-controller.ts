@@ -785,11 +785,17 @@ export class ExtensionUiController {
 										onGrant: (grant, always) => settle(always ? grant.alwaysLabel : grant.label),
 									}
 								: {}),
-							draft: {
-								hasDraft: () =>
-									editor.getText().length > 0 || editor.pendingImages.length > 0 || editor.pasteInFlight,
-								handleInput: keyData => editor.handleDraftEdit(keyData),
-							},
+							// A permission answer must never submit the parked message draft.
+							draft:
+								process.env.PARA_OMP_LAYOUT === "top"
+									? undefined
+									: {
+											hasDraft: () =>
+												editor.getText().length > 0 ||
+												editor.pendingImages.length > 0 ||
+												editor.pasteInFlight,
+											handleInput: keyData => editor.handleDraftEdit(keyData),
+										},
 						},
 					);
 					this.ctx.closeLinkBrowser();
@@ -798,7 +804,7 @@ export class ExtensionUiController {
 					this.ctx.editorContainer.addChild(editor);
 					this.ctx.ui.setFocus(dialog);
 					// The dialog owns focus but forwards typing: keep the composer's cursor visible.
-					editor.focused = true;
+					editor.focused = process.env.PARA_OMP_LAYOUT !== "top";
 					// Its submissions steer this (main) session, even from a focused agent's view.
 					this.ctx.approvalOwnsComposer = true;
 					const releaseComposerOwner = this.#claimComposerOwner(dialog, () => true);
@@ -910,6 +916,7 @@ export class ExtensionUiController {
 		if (!ask) return false;
 		this.ctx.ui.setFocus(ask);
 		this.ctx.ui.requestRender();
+		if (ask instanceof AskDialogComponent) ask.releaseInputGuard();
 		return true;
 	}
 
@@ -949,8 +956,14 @@ export class ExtensionUiController {
 		this.#ask = dialog;
 		this.ctx.askContainer.addChild(dialog);
 		this.ctx.statusLine.setAwaitingAnswer(true);
-		if (this.ctx.editor.getText().trim()) this.ctx.ui.requestRender();
-		else this.focusAsk();
+		if (this.ctx.editor.getText().trim()) {
+			this.ctx.ui.requestRender();
+			// Grimoire top layout parks drafts instead of letting a send skip the
+			// ask: the ask still claims the keys, the guard proxies typing back.
+			if (process.env.PARA_OMP_LAYOUT === "top") this.focusAsk();
+		} else {
+			this.focusAsk();
+		}
 		return {
 			restore: () => {
 				this.ctx.editorContainer.clear();
@@ -1164,6 +1177,24 @@ export class ExtensionUiController {
 			let promptResolve: ((value: AskDialogPromptValue | AskDialogPromptDraft | undefined) => void) | undefined;
 			let closed = false;
 			// After a nested prompt took the composer's place: the composer back, the keys to the ask.
+			const draftEditor = this.ctx.editor;
+			// A draft in progress when the ask lands keeps the keyboard, so in-flight
+			// typing never answers by accident; up/down hand input to the ask and the
+			// draft stays parked beneath it until the ask closes.
+			const inputGuard =
+				process.env.PARA_OMP_LAYOUT !== "top" && draftEditor.getText().length > 0
+					? {
+							isBlocked: () => draftEditor.getText().length > 0,
+							handleInput: (keyData: string) => draftEditor.handleDraftEdit(keyData),
+							hint: "typing edits your prompt",
+							// Show the draft's insertion cursor while it owns input; drop it
+							// once the ask controls take over.
+							syncPresentation: (blocked: boolean) => {
+								draftEditor.focused = blocked;
+							},
+						}
+					: undefined;
+
 			const restoreAskDialog = (): void => {
 				if (!closed) slot.restore();
 			};
@@ -1247,6 +1278,7 @@ export class ExtensionUiController {
 					skipNotice: () => this.#skipNotice(),
 					claimKeys: () => this.focusAsk(),
 					releaseKeys: () => this.#focusComposer(),
+					inputGuard,
 				},
 			);
 			const slot = this.#mountAsk(askDialog);

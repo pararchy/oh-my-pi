@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -37,6 +38,7 @@ import {
 	type SherpaOnlineRecognizer,
 	type SherpaOnlineStream,
 	type SherpaRuntime,
+	type SherpaVad,
 } from "./sherpa-runtime";
 
 const ASR_TASK = "automatic-speech-recognition";
@@ -53,6 +55,16 @@ const HF_RESOLVE_BASE = "https://huggingface.co";
 // Coalesce download progress so streaming a multi-hundred-MB model file doesn't
 // flood the IPC channel with one event per chunk.
 const PROGRESS_EMIT_BYTES = 4_000_000;
+// Silero VAD v5 model weights, fetched raw from the snakers4/silero-vad repo
+// (the HuggingFace mirror is gated). The upstream file path is unversioned, so
+// the digest below is verified after every download — a changed upstream file
+// fails loudly instead of silently loading different weights.
+const VAD_MODEL_FILENAME = "silero_vad.onnx";
+const VAD_MODEL_URL = `https://raw.githubusercontent.com/snakers4/silero-vad/v5.0/files/${VAD_MODEL_FILENAME}`;
+const VAD_MODEL_SHA256 = "6b99cbfd39246b6706f98ec13c7c50c6b299181f2474fa05cbc8046acc274396";
+// Seconds of audio retained inside the native detector so finalized segments
+// can be drained; far above `maxSpeechDuration`.
+const VAD_BUFFER_SECONDS = 60;
 
 const sttModelDevicePreference = resolveTinyModelDevicePreference();
 const sttModelDtypeOverride = resolveTinyModelDtypeOverride();
@@ -219,15 +231,34 @@ async function downloadSherpaFile(
 	requestId: string,
 ): Promise<void> {
 	const url = `${HF_RESOLVE_BASE}/${repo}/resolve/main/${filename}`;
+	await downloadModelFile(url, dest, modelKey, transport, requestId, `${repo}/${filename}`, filename);
+}
+
+/**
+ * Stream a model file into the cache, writing to a `.part` sidecar and renaming
+ * on completion so an interrupted fetch never reads as cached. Emits coalesced
+ * progress for the aggregating client; when `sha256` is given the renamed file
+ * is verified and deleted on mismatch.
+ */
+async function downloadModelFile(
+	url: string,
+	dest: string,
+	modelKey: SttModelKey,
+	transport: SttTransport,
+	requestId: string,
+	name: string,
+	filename: string,
+	sha256?: string,
+): Promise<void> {
 	const response = await fetch(url, { redirect: "follow" });
 	if (!response.ok || !response.body) {
-		throw new Error(`Failed to download ${filename} (${repo}): HTTP ${response.status}`);
+		throw new Error(`Failed to download ${filename} (${name}): HTTP ${response.status}`);
 	}
 	const total = Number(response.headers.get("content-length") ?? 0);
 	transport.send({
 		type: "progress",
 		id: requestId,
-		event: { modelKey, status: "download", name: `${repo}/${filename}`, file: filename },
+		event: { modelKey, status: "download", name, file: filename },
 	});
 	const part = `${dest}.part`;
 	const handle = await fs.open(part, "w");
@@ -246,14 +277,7 @@ async function downloadSherpaFile(
 				transport.send({
 					type: "progress",
 					id: requestId,
-					event: {
-						modelKey,
-						status: "progress",
-						name: `${repo}/${filename}`,
-						file: filename,
-						loaded,
-						total: total || loaded,
-					},
+					event: { modelKey, status: "progress", name, file: filename, loaded, total: total || loaded },
 				});
 			}
 		}
@@ -261,6 +285,78 @@ async function downloadSherpaFile(
 		await handle.close();
 	}
 	await fs.rename(part, dest);
+	if (!sha256) return;
+	const digest = createHash("sha256")
+		.update(await fs.readFile(dest))
+		.digest("hex");
+	if (digest !== sha256) {
+		await fs.unlink(dest).catch(() => {});
+		throw new Error(`Downloaded ${filename} failed sha256 verification (${digest})`);
+	}
+}
+
+/**
+ * Ensure the pinned Silero VAD model is present in the cache. The `.part`
+ * rename guarantees a full file came through {@link downloadModelFile}, whose
+ * sha256 verification covers integrity; a wrong-size leftover is re-fetched.
+ */
+async function ensureVadModelFile(modelKey: SttModelKey, transport: SttTransport, requestId: string): Promise<string> {
+	const dir = path.join(getTinyModelsCacheDir(), "snakers4/silero-vad");
+	await fs.mkdir(dir, { recursive: true });
+	const dest = path.join(dir, VAD_MODEL_FILENAME);
+	const present = await fs
+		.stat(dest)
+		.then(stats => stats.size > 0)
+		.catch(() => false);
+	if (!present) {
+		await downloadModelFile(
+			VAD_MODEL_URL,
+			dest,
+			modelKey,
+			transport,
+			requestId,
+			`snakers4/silero-vad/${VAD_MODEL_FILENAME}`,
+			VAD_MODEL_FILENAME,
+			VAD_MODEL_SHA256,
+		);
+	}
+	return dest;
+}
+
+/**
+ * Load the native detector for one session. Model file verification and the
+ * shared runtime install are reused across sessions via the module caches.
+ */
+async function createVad(modelKey: SttModelKey, transport: SttTransport, requestId: string): Promise<SherpaVad> {
+	const [runtime, modelPath] = await Promise.all([
+		sherpaRuntime.load(() =>
+			loadSherpaRuntime(phase =>
+				transport.send({
+					type: "progress",
+					id: requestId,
+					event: { modelKey, status: phase, name: `${SHERPA_PACKAGE}@${SHERPA_VERSION}` },
+				}),
+			),
+		),
+		ensureVadModelFile(modelKey, transport, requestId),
+	]);
+	return new runtime.Vad(
+		{
+			sileroVad: {
+				model: modelPath,
+				threshold: 0.5,
+				minSpeechDuration: 0.25,
+				minSilenceDuration: 0.5,
+				maxSpeechDuration: 15,
+				windowSize: 512,
+			},
+			sampleRate: ASR_SAMPLE_RATE,
+			numThreads: 1,
+			provider: "cpu",
+			debug: 0,
+		},
+		VAD_BUFFER_SECONDS,
+	);
 }
 
 /**
@@ -416,12 +512,17 @@ async function transcribeAudio(
 
 async function handleBatchRequest(
 	transport: SttTransport,
-	request: Extract<SttWorkerInbound, { type: "transcribe" | "download" }>,
+	request: Extract<SttWorkerInbound, { type: "transcribe" | "download" | "vad_prepare" }>,
 ): Promise<void> {
 	try {
 		if (request.type === "download") {
 			await loadModel(request.modelKey, transport, request.id);
 			transport.send({ type: "downloaded", id: request.id });
+			return;
+		}
+		if (request.type === "vad_prepare") {
+			await createVad(request.modelKey, transport, request.id);
+			transport.send({ type: "vad_ready", id: request.id });
 			return;
 		}
 		const text = await transcribeAudio(transport, request.id, request.modelKey, request.audio, request.language);
@@ -454,6 +555,16 @@ interface StreamingSession {
 	pumping: boolean;
 	cancelled: boolean;
 	ended: boolean;
+	/** Neural speech detector backing `speech_activity` events when enabled. */
+	speechDetection: "energy" | "silero";
+	/** Resolves once the detector is ready; `null` when disabled or load failed. */
+	vad: Promise<SherpaVad | null>;
+	/** Incoming audio queued for the detector until it finishes loading. */
+	vadAudio: Float32Array[];
+	/** Last reported detector state; emitted only on transitions. */
+	vadActive: boolean;
+	/** Set when Stop arrives while detector audio may still be queued. */
+	vadFlush: boolean;
 }
 
 const sessions = new Map<string, StreamingSession>();
@@ -494,10 +605,76 @@ function startStreamingSession(
 		pumping: false,
 		cancelled: false,
 		ended: false,
+		speechDetection: request.speechDetection === "silero" ? "silero" : "energy",
+		vad: Promise.resolve(null),
+		vadAudio: [],
+		vadActive: false,
+		vadFlush: false,
 	};
+	if (session.speechDetection === "silero") {
+		const report = (detector: "silero" | "energy"): void => {
+			if (sessions.get(request.id) === session && !session.cancelled) {
+				transport.send({ type: "detector", id: request.id, detector });
+			}
+		};
+		session.vad = createVad(request.modelKey, transport, request.id)
+			.then(vad => {
+				report("silero");
+				return vad;
+			})
+			.catch(error => {
+				// Detection degrades to energy rather than failing the session.
+				sendLog(transport, "warn", "stt: neural speech detector unavailable", {
+					error: errorMessage(error),
+				});
+				report("energy");
+				return null;
+			});
+	}
 	sessions.set(request.id, session);
 	// Observe load failures even if no audio arrives (or startup is cancelled).
 	void pumpSession(session, transport);
+}
+
+/**
+ * Feed queued audio to the neural detector and report speech-state transitions.
+ * Detector internals stay on the worker thread; only `active` edges cross IPC.
+ */
+async function drainVad(session: StreamingSession, transport: SttTransport): Promise<void> {
+	if (session.speechDetection !== "silero") {
+		session.vadAudio.length = 0;
+		return;
+	}
+	const vad = await session.vad;
+	if (!vad) {
+		// Detector failed to load: stop queuing audio for it.
+		session.speechDetection = "energy";
+		session.vadAudio.length = 0;
+		return;
+	}
+	if (session.vadAudio.length === 0 && !session.vadFlush) return;
+	for (const audio of session.vadAudio) vad.acceptWaveform(audio);
+	session.vadAudio.length = 0;
+	// Honor a pending flush after feeding queued audio so an open speech run
+	// closes promptly when the stream stops.
+	if (session.vadFlush) {
+		session.vadFlush = false;
+		vad.flush();
+	}
+	// Drop finalized speech runs; only the open/closed state matters upstream.
+	while (!vad.isEmpty()) vad.pop();
+	const active = vad.isDetected();
+	if (active !== session.vadActive) {
+		session.vadActive = active;
+		transport.send({ type: "speech_activity", id: session.id, active });
+	}
+}
+
+/** Emit the closing speech-state edge when a session ends mid-utterance. */
+function emitSpeechEnd(session: StreamingSession, transport: SttTransport): void {
+	if (!session.vadActive) return;
+	session.vadActive = false;
+	transport.send({ type: "speech_activity", id: session.id, active: false });
 }
 
 function ingestStreamEvents(session: StreamingSession, events: EndpointerEvent[]): void {
@@ -541,6 +718,8 @@ async function pumpOnlineSession(
 	transport: SttTransport,
 	recognizer: SherpaOnlineRecognizer,
 ): Promise<void> {
+	// Detector inference is cheap and independent of the ASR model lock.
+	await drainVad(session, transport);
 	await runOnModel(async () => {
 		if (session.cancelled) return;
 		const stream = (session.onlineStream ??= recognizer.createStream());
@@ -554,6 +733,7 @@ async function pumpOnlineSession(
 		stream.inputFinished();
 		decodeOnlineStream(session, transport, recognizer, stream, true);
 		commitOnlineSegment(session, transport, recognizer.getResult(stream).text.trim());
+		emitSpeechEnd(session, transport);
 		transport.send({ type: "stream_done", id: session.id, text: session.committed.join(" ") });
 		sessions.delete(session.id);
 	});
@@ -576,9 +756,12 @@ async function pumpSession(session: StreamingSession, transport: SttTransport): 
 				await pumpOnlineSession(session, transport, model.recognizer);
 				if (session.audioQueue.length === 0 && !session.ended) break;
 			}
+			// Detector work queued during the decode still needs its edges.
+			await drainVad(session, transport);
 			return;
 		}
 		while (!session.cancelled) {
+			await drainVad(session, transport);
 			if (session.segmentQueue.length > 0) {
 				const audio = session.segmentQueue.shift()!;
 				// A fresh segment supersedes any queued preview for the prior one.
@@ -608,11 +791,13 @@ async function pumpSession(session: StreamingSession, transport: SttTransport): 
 			break;
 		}
 		if (session.ended && !session.cancelled && session.segmentQueue.length === 0 && !session.pendingPartial) {
+			emitSpeechEnd(session, transport);
 			transport.send({ type: "stream_done", id: session.id, text: session.committed.join(" ") });
 			sessions.delete(session.id);
 		}
 	} catch (error) {
 		if (!session.cancelled) transport.send({ type: "error", id: session.id, error: errorText(error) });
+		emitSpeechEnd(session, transport);
 		sessions.delete(session.id);
 	} finally {
 		session.pumping = false;
@@ -621,7 +806,10 @@ async function pumpSession(session: StreamingSession, transport: SttTransport): 
 
 function handleStreamMessage(
 	transport: SttTransport,
-	message: Extract<SttWorkerInbound, { type: "stream_start" | "stream_audio" | "stream_stop" | "stream_cancel" }>,
+	message: Extract<
+		SttWorkerInbound,
+		{ type: "stream_start" | "stream_audio" | "stream_stop" | "stream_cancel" | "stream_detect" }
+	>,
 ): void {
 	if (message.type === "stream_start") {
 		startStreamingSession(transport, message);
@@ -632,6 +820,7 @@ function handleStreamMessage(
 	switch (message.type) {
 		case "stream_audio":
 			if (session.ended) return;
+			if (session.speechDetection === "silero") session.vadAudio.push(message.audio);
 			if (session.spec.engine === "sherpa" && session.spec.mode === "online") {
 				session.audioQueue.push(message.audio);
 			} else {
@@ -639,10 +828,18 @@ function handleStreamMessage(
 			}
 			void pumpSession(session, transport);
 			return;
+		case "stream_detect":
+			if (session.ended) return;
+			if (session.speechDetection === "silero") {
+				session.vadAudio.push(message.audio);
+				void pumpSession(session, transport);
+			}
+			return;
 		case "stream_stop":
 			if (session.ended) return;
 			session.ended = true;
 			session.pendingPartial = null;
+			session.vadFlush = true;
 			if (!(session.spec.engine === "sherpa" && session.spec.mode === "online")) {
 				ingestStreamEvents(session, session.endpointer.flush());
 			}
@@ -653,6 +850,9 @@ function handleStreamMessage(
 			session.audioQueue.length = 0;
 			session.segmentQueue.length = 0;
 			session.pendingPartial = null;
+			session.vadAudio.length = 0;
+			session.vadFlush = false;
+			emitSpeechEnd(session, transport);
 			sessions.delete(message.id);
 			return;
 	}
@@ -666,6 +866,7 @@ export function startSttWorker(transport: SttTransport): void {
 				return;
 			case "transcribe":
 			case "download":
+			case "vad_prepare":
 				void handleBatchRequest(transport, message);
 				return;
 			default:

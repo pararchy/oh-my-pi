@@ -53,6 +53,7 @@ import {
 	isUserInterruptAbort,
 	USER_INTERRUPT_LABEL,
 } from "../../session/messages";
+import { liveCallActive } from "../../live/activity";
 import { previewLine, PREVIEW_LIMITS, TRUNCATE_LENGTHS } from "@oh-my-pi/pi-tui/render/render-utils";
 import { PROPOSE_COMMAND_NAME } from "@oh-my-pi/pi-tui/tools/resolve";
 import type { PlanApprovalDetails } from "../../plan-mode/approved-plan";
@@ -2987,7 +2988,7 @@ export class EventController {
 		if (isWarpCliAgentProtocolActive()) return;
 
 		const notify = cfgErrorNotify.get(settings);
-		if (notify === "off") return;
+		if (notify === "off" || liveCallActive()) return;
 
 		// Read the turn's own outcome from `agent_end.messages`, not the mutable
 		// active context: a classifier-refusal failure is final (stopReason ===
@@ -3009,7 +3010,7 @@ export class EventController {
 
 	sendCompletionNotification(event: Extract<AgentSessionEvent, { type: "agent_end" }>): void {
 		const notify = cfgCompletionNotify.get(settings);
-		if (notify === "off") return;
+		if (notify === "off" || liveCallActive()) return;
 
 		// Warp structured OSC 777 already drives native completion UX when the
 		// protocol is negotiated — avoid a second legacy desktop/OSC-9 toast.

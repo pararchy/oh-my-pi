@@ -1017,6 +1017,7 @@
 
 - ovnfs turns on by itself when its binary is found (`ovnfs.path`, else `ovnfs` on PATH): agents get the separate-checkout guidance, and isolated subagents use ovnfs checkouts when `isolation.backend` is `auto`
 - Text Verbosity now defaults to low and applies to Codex too, matching the official Codex client: shorter answers that finish sooner; set `textVerbosity` to `medium` for the old length
+- Hidden finalized `live-transcript` appends notify extension `message_end` observers without publishing transcript paint events or starting an agent turn, enabling bounded memory capture during voice-only conversations.
 - A cost cap set on the main thread now applies to running subagents immediately
 - RPC wire protocol and task streaming have lower serialization overhead
 - Local Whisper speech-to-text, Parakeet/Nemotron speech, and the local tiny model install their runtimes on first use, shrinking installs; first use needs network access
@@ -1041,6 +1042,8 @@
 - On macOS, the browser tool's headless Chromium keeps background tabs at normal CPU priority, so on a busy machine `tab.traceStart()`, opening a second tab, and other calls into background tabs no longer stall or time out
 - Subagents loading MCP tools (such as Kata's `load_*`) no longer change the main session's tools or system prompt
 - Mounting an MCP tool mid-session on prefix-bound models no longer changes the eval tool description, and the mount notice now reaches the model
+- Local `/live` now gates quiet microphone noise and short impulses before recognition (`live.micThreshold`), preserves speech onset, submits finalized words without partial duplication, and admits stop/steering without waiting for the previous answer. Muting discards stale recognition results; barge-in duration is measured in audio samples. Local speech still uses the session's configured reasoning provider, not necessarily an offline model.
+- Local `/live` speech activity is detected by the bundled Silero VAD (sherpa-onnx): microphone audio is screened by the neural detector and barge-in during playback requires detector confirmation on top of the energy prefilter, so speaker bleed no longer interrupts replies. The ~2 MB model downloads and sha256-verifies once at call start; if it is unavailable the detector reports `energy` and the previous heuristic applies. Streaming STT sessions accept `speechDetection: "silero"` with `onSpeech`/`onDetector` callbacks and a `pushDetect` channel that senses speech without feeding the recognizer.
 - Worker-thread subagents are faster: switching views on long transcripts no longer lags, `wait` no longer streams full transcripts, and they stall less on a busy main thread
 - Streaming a large batch `task` call no longer slows quadratically (about 80 ms → 2 ms for a 200 KB call)
 - `computer` from Eval now uses `zoom` for legible close-ups instead of cropping the downscaled screenshot ([#18158](https://github.com/can1357/oh-my-pi/pull/18158) by [@will-bogusz](https://github.com/will-bogusz))
@@ -1225,6 +1228,13 @@
 - Fixed `read` of a whole URL returning no content when the page's first line is over the 50 KB output budget, as on minified pages read with `:raw`; it now shows that line's first 50 KB ([#17500](https://github.com/can1357/oh-my-pi/pull/17500) by [@will-bogusz](https://github.com/will-bogusz))
 - Fixed an advisor whose usage-limited account kept being reported as switchable retrying the same capped account thousands of times; it now tries each sibling account at most once per provider per failing review, then falls back, waits, or pauses on the quota ([#17472](https://github.com/can1357/oh-my-pi/issues/17472))
 - Fixed LSP definition, type definition, implementation and reference results carrying a stray carriage return on every source context line from files with Windows (CRLF) line endings ([#17549](https://github.com/can1357/oh-my-pi/pull/17549) by [@JustasMasiulis](https://github.com/JustasMasiulis))
+### Grimoire personal fork
+
+- Added opt-in fixed-top persona/status/dialog chrome with a separately scrolling conversation and parked prompt editor (`PARA_OMP_LAYOUT=top`).
+- Approval and ask-dialog navigation no longer submits a nonempty parked draft in Grimoire mode.
+- Kept terminal image budgeting and cursor rendering inside the fullscreen lifecycle; upstream default mode remains unchanged.
+- Restored ordinary mouse-wheel scrolling in fixed-top chat, including after closing fullscreen pickers. Terminal text selection uses Shift+drag / Shift+click; normal-buffer mouse capture remains opt-in.
+
 
 ## [18.14.1] - 2026-10-31
 

@@ -26,6 +26,7 @@ import { TERMINAL } from "@oh-my-pi/pi-tui";
 import { createInteractiveModeContext } from "../../helpers/interactive-mode-context";
 
 import { cfgCompletionNotify, cfgErrorNotify } from "@oh-my-pi/pi-coding-agent/modes/settings";
+import { enterLiveCall } from "@oh-my-pi/pi-coding-agent/live/activity";
 
 const originalWarpProtocolVersion = process.env.WARP_CLI_AGENT_PROTOCOL_VERSION;
 
@@ -198,6 +199,24 @@ describe("EventController.sendErrorNotification", () => {
 });
 
 describe("EventController — notifications through the real turn-end path (#handleAgentEnd)", () => {
+	it("keeps live replies quiet and restores desktop notifications after the call closes", async () => {
+		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+		cfgErrorNotify.override(settings, "on");
+		cfgCompletionNotify.override(settings, "on");
+		const controller = new EventController(makeTurnEndContext());
+		const leaveCall = enterLiveCall();
+		try {
+			await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("stop")]));
+			await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("error")]));
+			expect(spy).not.toHaveBeenCalled();
+		} finally {
+			leaveCall();
+		}
+		await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("stop")]));
+		expect(spy).toHaveBeenCalledTimes(1);
+		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ type: "completion" }));
+	});
+
 	it("fires only the error toast — never a paired 'Complete' toast — for one error-ending turn", async () => {
 		// Regression for the exact coupling bug: with both notify settings on,
 		// a classifier-refusal turn's stale active context must not let

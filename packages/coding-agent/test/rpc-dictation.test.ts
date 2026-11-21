@@ -194,6 +194,7 @@ describe("RpcDictationBridge", () => {
 			streamOptions = options;
 			return {
 				pushAudio: () => {},
+				pushDetect: () => {},
 				cancel: () => {},
 				stop: async () => {
 					streamOptions?.onSegment?.("world", 1);

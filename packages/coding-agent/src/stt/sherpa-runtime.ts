@@ -53,12 +53,44 @@ export interface SherpaOnlineRecognizer {
 	reset(stream: SherpaOnlineStream): void;
 }
 
+/** Silero VAD constructor config (mirrors `VadConfig` in sherpa-onnx-node types). */
+export interface SherpaVadConfig {
+	sileroVad: {
+		model: string;
+		threshold: number;
+		minSpeechDuration: number;
+		minSilenceDuration: number;
+		maxSpeechDuration: number;
+		windowSize: number;
+	};
+	sampleRate: number;
+	numThreads: number;
+	provider: string;
+	debug: number;
+}
+
+/**
+ * A sherpa-onnx Silero voice-activity detector. `acceptWaveform` runs the
+ * neural model synchronously on 30 ms windows; `isDetected` reflects whether
+ * speech is currently open (true from onset until a segment finalizes).
+ */
+export interface SherpaVad {
+	acceptWaveform(samples: Float32Array): void;
+	isDetected(): boolean;
+	isEmpty(): boolean;
+	front(): { samples: Float32Array };
+	pop(): void;
+	flush(): void;
+	clear(): void;
+}
+
 /** The native sherpa-onnx module surface used by the STT worker. */
 export interface SherpaRuntime {
 	OfflineRecognizer: {
 		createAsync(config: SherpaOfflineConfig): Promise<SherpaOfflineRecognizer>;
 	};
 	OnlineRecognizer: new (config: SherpaOfflineConfig & { enableEndpoint: boolean }) => SherpaOnlineRecognizer;
+	Vad: new (config: SherpaVadConfig, bufferSizeInSeconds: number) => SherpaVad;
 }
 
 /**

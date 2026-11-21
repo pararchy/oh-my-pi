@@ -1,5 +1,7 @@
 import type { SttModelKey } from "./models";
 
+export type SpeechDetection = "energy" | "silero";
+
 export type SttProgressStatus = "initiate" | "download" | "progress" | "progress_total" | "done" | "ready" | "error";
 
 export interface SttProgressFileState {
@@ -24,20 +26,26 @@ export type SttWorkerInbound =
 	| { type: "ping"; id: string }
 	| { type: "transcribe"; id: string; modelKey: SttModelKey; audio: Float32Array; language?: string }
 	| { type: "download"; id: string; modelKey: SttModelKey }
+	| { type: "vad_prepare"; id: string; modelKey: SttModelKey }
 	// ── Live streaming session ──
 	// `stream_start` warms the model and opens a session; `stream_audio` feeds
 	// 16 kHz mono float frames as they arrive from the recorder; `stream_stop`
 	// flushes the trailing speech segment and ends the session; `stream_cancel`
 	// tears it down without a final flush. All carry the same `id`.
-	| { type: "stream_start"; id: string; modelKey: SttModelKey; language?: string }
+	| { type: "stream_start"; id: string; modelKey: SttModelKey; language?: string; speechDetection?: SpeechDetection }
 	| { type: "stream_audio"; id: string; audio: Float32Array }
 	| { type: "stream_stop"; id: string }
-	| { type: "stream_cancel"; id: string };
+	| { type: "stream_cancel"; id: string }
+	// `stream_detect` feeds audio only to the neural speech detector — the
+	// segmenter and recognizer never see it. Used for ungated activity sensing
+	// while echo-gated mic input is still withheld from transcription.
+	| { type: "stream_detect"; id: string; audio: Float32Array };
 
 export type SttWorkerOutbound =
 	| { type: "pong"; id: string }
 	| { type: "transcription"; id: string; text: string }
 	| { type: "downloaded"; id: string }
+	| { type: "vad_ready"; id: string }
 	| { type: "error"; id: string; error: string }
 	| { type: "progress"; id: string; event: SttProgressEvent }
 	| { type: "log"; level: "debug" | "warn" | "error"; msg: string; meta?: Record<string, unknown> }
@@ -48,6 +56,10 @@ export type SttWorkerOutbound =
 	// full transcript (all committed segments joined) when the session ends.
 	| { type: "partial"; id: string; text: string }
 	| { type: "segment"; id: string; index: number; text: string }
+	| { type: "speech_activity"; id: string; active: boolean }
+	// `detector` reports which speech detector the session ended up with —
+	// `"energy"` when no neural detector was requested or its load failed.
+	| { type: "detector"; id: string; detector: SpeechDetection }
 	| { type: "stream_done"; id: string; text: string };
 
 /**

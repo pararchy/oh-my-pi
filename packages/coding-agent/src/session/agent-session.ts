@@ -11630,6 +11630,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				{ type: "message_end", message: normalizedAppMessage },
 				{ detachExtensions: true },
 			);
+		} else if (normalizedAppMessage.customType === "live-transcript") {
+			// Finalized voice turns are hidden appends, not agent turns. Notify
+			// lifecycle extensions without publishing a paint event or starting
+			// inference; memory capture otherwise never sees voice-only dialogue.
+			this.#queueExtensionEvent({ type: "message_end", message: normalizedAppMessage });
 		}
 		return false;
 	}

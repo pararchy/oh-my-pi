@@ -237,6 +237,7 @@ describe("STTController cloud transcription", () => {
 		const stop = vi.fn().mockResolvedValue("local transcript");
 		const startStream = vi.spyOn(asrClient.sttClient, "startStream").mockReturnValue({
 			pushAudio,
+			pushDetect: vi.fn(),
 			stop,
 			cancel: vi.fn(),
 		});

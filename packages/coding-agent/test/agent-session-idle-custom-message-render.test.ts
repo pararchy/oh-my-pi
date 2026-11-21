@@ -5,6 +5,7 @@ import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
@@ -28,7 +29,7 @@ describe("AgentSession idle custom message render", () => {
 		tempDir.removeSync();
 	});
 
-	function createSession(): { session: AgentSession; streamCalls: () => number } {
+	function createSession(extensionRunner?: ExtensionRunner): { session: AgentSession; streamCalls: () => number } {
 		const model = createMockModel({ provider: "openai", id: "gpt-test" }).model;
 		const modelRegistry = new ModelRegistry(authStorage);
 		let streamCallCount = 0;
@@ -49,6 +50,7 @@ describe("AgentSession idle custom message render", () => {
 			settings,
 			modelRegistry,
 			toolRegistry: new Map(),
+			extensionRunner,
 		});
 		return { session: created, streamCalls: () => streamCallCount };
 	}
@@ -158,5 +160,37 @@ describe("AgentSession idle custom message render", () => {
 			.getEntries()
 			.filter(e => e.type === "custom_message" && e.customType === "idle-hidden");
 		expect(persisted.length).toBe(1);
+	});
+
+	it("delivers finalized hidden voice turns to extensions without painting or prompting", async () => {
+		const observed = Promise.withResolvers<unknown>();
+		// Minimal notification-only runner: the real session dispatch is under test.
+		const runner = {
+			hasHandlers: (type: string) => type === "message_end",
+			async emit(event: unknown) {
+				observed.resolve(event);
+			},
+		} as unknown as ExtensionRunner;
+		const created = createSession(runner);
+		session = created.session;
+		const publicEvents: string[] = [];
+		session.subscribe(event => publicEvents.push(event.type));
+		const dispatched = await session.sendCustomMessage({
+			customType: "live-transcript",
+			content: "[Voice user] Remember that I prefer compact query plans.",
+			display: false,
+			details: { role: "user" },
+			attribution: "user",
+		});
+		expect(await observed.promise).toMatchObject({
+			type: "message_end",
+			message: { role: "custom", customType: "live-transcript", display: false },
+		});
+		expect(dispatched).toBe(false);
+		expect(created.streamCalls()).toBe(0);
+		expect(publicEvents).toEqual([]);
+		expect(session.sessionManager.getEntries()).toContainEqual(
+			expect.objectContaining({ type: "custom_message", customType: "live-transcript", display: false }),
+		);
 	});
 });

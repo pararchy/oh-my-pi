@@ -102,6 +102,7 @@ import {
 import { actionBar, actionButton } from "../native/overlay";
 import { getKeybindings } from "../keybindings";
 import { isNativeRendering } from "../native/state";
+import { plainText } from "../native/spans";
 
 const OTHER_OPTION = "Other (type your own)";
 const RECOMMENDED_SUFFIX = " (Recommended)";
@@ -156,6 +157,23 @@ interface AskDialogCallbacks {
 	): Promise<AskDialogPromptValue | AskDialogPromptDraft | undefined>;
 }
 
+/**
+ * Routes typing to a composer draft that was in progress when the dialog
+ * opened, so in-flight keystrokes never answer by accident. The up/down select
+ * keys are the explicit hand-off: they release the guard for the rest of the
+ * dialog's life and the draft stays parked (intact) beneath it.
+ */
+interface AskDialogInputGuard {
+	isBlocked(): boolean;
+	handleInput(keyData: string): void;
+	/** Shown after the release keys while the guard holds input. */
+	hint: string;
+	/** Mirror the guard's blocked state onto the proxied draft surface each
+	 *  render, so a draft that owns input shows a visible insertion cursor even
+	 *  though this dialog holds TUI focus, and drops it once the dialog takes over. */
+	syncPresentation?(blocked: boolean): void;
+}
+
 interface AskDialogOptions {
 	timeout?: number;
 	onTimeout?: () => void;
@@ -166,6 +184,8 @@ interface AskDialogOptions {
 	claimKeys?(): void;
 	/** Esc (and natively Tab past the last question): the host hands the keyboard to the composer under the ask. */
 	releaseKeys?(): void;
+	/** Routes in-flight typing to a composer draft parked beneath the dialog. */
+	inputGuard?: AskDialogInputGuard;
 }
 
 interface QuestionState {
@@ -608,6 +628,10 @@ export class AskDialogComponent implements Component {
 	#hidden = false;
 	/** Memoized native description; dropped whenever dialog state may have changed. */
 	#native: NativeNode | undefined;
+	/** Input-guard blocked state {@link #native} was described with (the guard flips outside this dialog). */
+	#nativeBlocked = false;
+	/** Set once the user explicitly takes the dialog (up/down, or a pointer action) while a draft held input. */
+	#guardReleased = false;
 	/** Skip notice {@link #native} was described with (it changes outside this dialog). */
 	#nativeSkip: string | undefined;
 	/** Bumped whenever another question opens natively, so Tern scrolls it into view. */
@@ -712,6 +736,18 @@ export class AskDialogComponent implements Component {
 			this.options.releaseKeys?.();
 			return;
 		}
+		if (this.#guardBlocks()) {
+			if (
+				getKeybindings().matches(keyData, "tui.select.up") ||
+				getKeybindings().matches(keyData, "tui.select.down")
+			) {
+				this.#releaseGuard();
+				return;
+			}
+			this.options.inputGuard?.handleInput(keyData);
+			this.#requestRender();
+			return;
+		}
 		// The native card sits in the transcript, out of the composer's way: nothing to hide.
 		const native = isNativeRendering();
 		if (getKeybindings().matches(keyData, "app.ask.hide")) {
@@ -733,6 +769,10 @@ export class AskDialogComponent implements Component {
 	}
 
 	render(width: number): readonly string[] {
+		// Keep the proxied draft's cursor visible while it owns input (the editor
+		// renders as the next sibling in the same container, so this lands in the
+		// same frame).
+		this.options.inputGuard?.syncPresentation?.(this.#guardBlocks());
 		if (this.#hidden) return this.#renderHidden(width);
 		const innerWidth = Math.max(1, width - 4);
 		this.#contentWidth = innerWidth;
@@ -788,10 +828,13 @@ export class AskDialogComponent implements Component {
 	 * pills, then the action bar (the countdown, Note, Cancel and the primary Submit).
 	 */
 	describe(cx: DescribeContext): NativeNode {
+		// Same draft-cursor mirroring as render(): the proxied draft describes itself next to this dialog.
+		const blocked = this.#guardBlocks();
+		this.options.inputGuard?.syncPresentation?.(blocked);
 		const ring = this.#countdown !== undefined && cx.supports("meter");
 		if (ring) this.#startRingTick();
 		const skip = this.options.skipNotice?.();
-		if (this.#native && this.#nativeSkip === skip) return this.#native;
+		if (this.#native && this.#nativeSkip === skip && this.#nativeBlocked === blocked) return this.#native;
 		const open = this.#currentQuestionIndex();
 		const body: NativeChild[] = [];
 		let answered = 0;
@@ -817,9 +860,10 @@ export class AskDialogComponent implements Component {
 			...(total > 1 ? { progress: `${answered} of ${total} answered` } : {}),
 			body,
 			...(skip ? { skip } : {}),
-			actions: this.#describeActions(ring),
+			actions: this.#describeActions(ring, blocked),
 		});
 		this.#nativeSkip = skip;
+		this.#nativeBlocked = blocked;
 		return this.#native;
 	}
 
@@ -915,9 +959,17 @@ export class AskDialogComponent implements Component {
 	 * (every answer, or the first unanswered question while one is left). Buttons say what they do;
 	 * their keys live in their tooltips.
 	 */
-	#describeActions(ring: boolean): NativeNode {
+	#describeActions(ring: boolean, blocked = this.#guardBlocks()): NativeNode {
 		const cancel = actionButton("Cancel", "cancel", { title: "Cancel without answering" });
 		const lead: NativeNode[] = this.#countdown ? [this.#describeTimer(this.#countdown, ring)] : [];
+		const inputGuard = this.options.inputGuard;
+		if (blocked && inputGuard) {
+			return actionBar([
+				...lead,
+				text([span(plainText(this.#guardHint(inputGuard)), "muted")], { truncate: "end", role: "omp.ask.summary" }),
+				cancel,
+			]);
+		}
 		const note = actionButton("Note", "note", {
 			keys: "n",
 			title: "Add a note to the highlighted answer  n",
@@ -946,9 +998,11 @@ export class AskDialogComponent implements Component {
 				this.#submitOrOpenUnanswered();
 			} else if (event.act === "note") this.#noteFromPointer(event.key);
 			else this.#openOrPick(event.act);
+			this.#releaseGuardForPointer();
 			return;
 		}
 		if (event.type !== "select" && event.type !== "activate") return;
+		this.#releaseGuardForPointer();
 		if (leafKey(event.key) !== `q${this.#currentQuestionIndex()}`) return;
 		const active = this.#activeQuestionState();
 		if (!active) return;
@@ -1173,6 +1227,35 @@ export class AskDialogComponent implements Component {
 		this.#countdown?.reset();
 		this.#requestRender();
 	}
+
+	/** True while a draft that predates the dialog still owns typing. */
+	#guardBlocks(): boolean {
+		return !this.#guardReleased && (this.options.inputGuard?.isBlocked() ?? false);
+	}
+
+	/** Up/down hand the keyboard to the dialog for good; the draft stays untouched beneath it. */
+	#releaseGuard(): void {
+		this.#guardReleased = true;
+		this.#native = undefined;
+		this.#hidden = false;
+		this.#requestRender();
+	}
+
+	#releaseGuardForPointer(): void {
+		if (!this.#guardBlocks()) return;
+		this.#guardReleased = true;
+		this.#native = undefined;
+	}
+
+	#guardHint(inputGuard: AskDialogInputGuard): string {
+		return `${editorKeys("tui.select.up", "tui.select.down")} answer · ${inputGuard.hint}`;
+	}
+
+	/** Host hand-off: claiming the keyboard for the dialog releases the draft guard the same way up/down does. */
+	releaseInputGuard(): void {
+		this.#releaseGuard();
+	}
+
 
 	/** Hidden: one line in the composer's place — title (with countdown), the question clipped to fit, and how to bring it back. */
 	#renderHidden(width: number): readonly string[] {
