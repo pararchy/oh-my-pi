@@ -168,6 +168,10 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 		if (!value.trim()) throw new CliUsageError("--goal requires a non-empty objective.");
 		result.goal = value.trim();
 	},
+	"--live": (result, value) => {
+		if (value === "codex" || value === "local") result.live = value;
+		else result.invalidFlagValues.push("--live requires codex or local.");
+	},
 	"--plan": (result, value) => {
 		result.plan = value;
 	},
@@ -445,6 +449,7 @@ const ONE_SHOT_LAUNCH_FLAGS: Readonly<Record<string, true>> = {
 	"--from-claude": true,
 	"--from-codex": true,
 	"--goal": true,
+	"--live": true,
 };
 
 /**

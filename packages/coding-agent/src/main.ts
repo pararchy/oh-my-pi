@@ -668,6 +668,7 @@ async function runInteractiveMode(
 	startupLease?: ComposerLease,
 	startupGoal?: string,
 	startupRestore?: () => Promise<RestoreOutcome>,
+	startupLive?: Args["live"],
 ): Promise<void> {
 	const InteractiveModeConstructor = await loadInteractiveModeConstructor();
 	let mode: InteractiveMode;
@@ -871,6 +872,13 @@ async function runInteractiveMode(
 		}
 	}
 	mode.settleStartupRun();
+	if (startupLive) {
+		try {
+			await mode.handleLiveCommand(startupLive);
+		} catch (error: unknown) {
+			mode.showError(error instanceof Error ? error.message : "Unknown error occurred");
+		}
+	}
 
 	while (true) {
 		const input = await mode.getUserInput();
@@ -1964,6 +1972,9 @@ export async function runRootCommand(
 		// transcripts (or an opened picker) behind a usage error.
 		validateGoalLaunch(parsedArgs, isInteractive);
 		validateRestoreLaunch(parsedArgs, isInteractive);
+		if (parsedArgs.live && !isInteractive) {
+			throw new CliUsageError("--live requires an interactive terminal (not --print or --mode).");
+		}
 		// Without piped text the prompt must come from argv, which only the
 		// post-extension reparse can settle: an extension string flag's value
 		// (`--spawn-peer reviewer`) looks like a prompt here, and a boolean flag
@@ -2922,6 +2933,7 @@ export async function runRootCommand(
 						startupLease,
 						initialArgs.goal,
 						parsedArgs.restore ? () => restoreSession(session, { eventBus, subagentEventBus }) : undefined,
+						initialArgs.live,
 					);
 				} finally {
 					startupLease?.dispose();

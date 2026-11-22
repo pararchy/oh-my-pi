@@ -25,6 +25,7 @@ export const launchHelp = {
 			description:
 				"Start fresh in goal mode (interactive only; bypasses autoResume; no positional prompt, startup plan mode, or explicit resume)",
 		}),
+		live: Flags.string({ description: "Open a voice call on startup (codex or local; interactive only)" }),
 		prewalk: Flags.boolean({
 			description:
 				"Switch from the active model to a fast/cheap model at the first edit/write after the plan's todo list exists (default off; see prewalk.enabled)",
