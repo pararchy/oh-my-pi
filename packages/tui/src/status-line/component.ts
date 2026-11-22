@@ -3776,6 +3776,8 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 						.map(part => truncateToWidth(part, width)));
 				} else if (key === "mcp") {
 					rows.right.push(...clean.split(" · ").map(part => truncateToWidth(part, width)));
+				} else if (key === "para-launch-profile") {
+					rows.left.push(truncateToWidth(clean, width));
 				} else rows.below.push(clean);
 			}
 		}
